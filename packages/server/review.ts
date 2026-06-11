@@ -11,7 +11,7 @@
 
 import { isRemoteSession, getServerHostname, getServerPort } from "./remote";
 import type { Origin } from "@plannotator/shared/agents";
-import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, gitRuntime } from "./vcs";
+import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, getVcsDiffFingerprint, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext, detectRemoteDefaultCompareTarget, gitRuntime } from "./vcs";
 import { basename } from "node:path";
 import { parseWorktreeDiffType, resolveBaseBranch } from "@plannotator/shared/review-core";
 import {
@@ -26,6 +26,7 @@ import {
 import type { SemanticDiffAvailability, SemanticDiffResponse } from "@plannotator/shared/semantic-diff-types";
 import {
   getPRDiffScopeOptions,
+  getPRFullStackFingerprint,
   getPRStackInfo,
   resolveStackInfo,
   resolvePRFullStackBaseRef,
@@ -186,6 +187,52 @@ export async function startReviewServer(
   const detectedCompareTarget = (): string => gitContext?.defaultBranch || gitContext?.compareTarget?.fallback || "main";
   let currentBase = options.initialBase || detectedCompareTarget();
   let baseEverSwitched = false;
+
+  // --- Diff staleness fingerprint -------------------------------------------
+  // Captured beside every patch snapshot (startup + every switch endpoint);
+  // GET /api/diff/fresh recomputes and compares so the client can show a
+  // "diff out of date — refresh" notice when files change mid-review (e.g. an
+  // agent editing/committing while the user reviews). Best-effort everywhere:
+  // null means "cannot fingerprint" and is reported as fresh, never stale.
+  let currentFingerprint: string | null = null;
+  const computeDiffFingerprint = async (): Promise<string | null> => {
+    try {
+      if (workspace) return await workspace.getFingerprint();
+      if (isPRMode) {
+        if (currentPRDiffScope === "layer") {
+          // Platform-computed diff — immutable locally. Recaptured on
+          // pr-switch; remote-side PR updates are out of scope here.
+          return `pr-layer:${prMetadata?.url ?? ""}`;
+        }
+        // Full-stack: three-dot diff against the local checkout — fingerprint
+        // (merge-base, HEAD), which changes exactly when the patch can.
+        const fullStackCwd =
+          (options.worktreePool && prMetadata
+            ? options.worktreePool.resolve(prMetadata.url)
+            : undefined) ?? options.agentCwd;
+        if (!prMetadata) return null;
+        return await getPRFullStackFingerprint(gitRuntime, prMetadata, fullStackCwd);
+      }
+      if (!hasLocalAccess) return null;
+      return await getVcsDiffFingerprint(currentDiffType as DiffType, currentBase, gitContext?.cwd, {
+        hideWhitespace: currentHideWhitespace,
+      });
+    } catch {
+      return null;
+    }
+  };
+  // Fire-and-forget capture: never delays the snapshot response it describes.
+  // Generation-guarded: two rapid switches can resolve their captures out of
+  // order — only the LATEST capture may write the baseline, otherwise a stale
+  // fingerprint would make /api/diff/fresh report stale forever.
+  let fingerprintGeneration = 0;
+  const captureDiffFingerprint = (): void => {
+    const generation = ++fingerprintGeneration;
+    void computeDiffFingerprint().then((fingerprint) => {
+      if (generation === fingerprintGeneration) currentFingerprint = fingerprint;
+    });
+  };
+  captureDiffFingerprint();
 
   const resolveReviewBase = (requestedBase?: string): string => {
     return resolveBaseBranch(requestedBase, detectedCompareTarget());
@@ -588,6 +635,23 @@ export async function startReviewServer(
             });
           }
 
+          // API: cheap staleness probe — has the underlying VCS state changed
+          // since the current diff snapshot was computed? Best-effort: anything
+          // that cannot be fingerprinted reports fresh (no banner).
+          if (url.pathname === "/api/diff/fresh" && req.method === "GET") {
+            const baseline = currentFingerprint;
+            if (baseline == null) return Response.json({ fresh: true });
+            const probe = await computeDiffFingerprint();
+            // A diff switch landing mid-probe replaces the snapshot (and its
+            // fingerprint); report fresh and let the next poll compare
+            // against the new baseline.
+            if (currentFingerprint !== baseline) return Response.json({ fresh: true });
+            const fresh = probe == null || probe === baseline;
+            // The probe fingerprint lets the client distinguish "still the
+            // same staleness I dismissed" from "ANOTHER change landed since".
+            return Response.json({ fresh, ...(fresh ? {} : { fingerprint: probe }) });
+          }
+
           // API: Get semantic diff content
           if (url.pathname === "/api/semantic-diff" && req.method === "GET") {
             return Response.json(await getSemanticDiff(url));
@@ -626,6 +690,7 @@ export async function startReviewServer(
                 currentDiffType = workspace.diffType;
                 currentError = snapshot.error;
                 draftKey = contentHash(currentPatch);
+                captureDiffFingerprint();
 
                 return Response.json({
                   rawPatch: currentPatch,
@@ -657,6 +722,7 @@ export async function startReviewServer(
               currentBase = base;
               baseEverSwitched = true;
               currentError = result.error;
+              captureDiffFingerprint();
 
               // Recompute gitContext for the effective cwd so the client's
               // sidebar (current branch, default branch, diff-mode options)
@@ -711,6 +777,7 @@ export async function startReviewServer(
                 currentGitRef = originalPRGitRef;
                 currentError = originalPRError;
                 currentPRDiffScope = "layer";
+                captureDiffFingerprint();
                 return Response.json({
                   rawPatch: currentPatch,
                   gitRef: currentGitRef,
@@ -739,6 +806,7 @@ export async function startReviewServer(
               currentGitRef = result.label;
               currentError = undefined;
               currentPRDiffScope = "full-stack";
+              captureDiffFingerprint();
 
               return Response.json({
                 rawPatch: currentPatch,
@@ -808,6 +876,7 @@ export async function startReviewServer(
               currentPRDiffScope = "layer";
               draftKey = contentHash(pr.rawPatch);
               prListCache = null;
+              captureDiffFingerprint();
 
               // Recompute stack info
               prStackInfo = getPRStackInfo(pr.metadata);

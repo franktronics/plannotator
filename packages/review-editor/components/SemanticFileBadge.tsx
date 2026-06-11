@@ -39,7 +39,22 @@ export const SemanticFileBadge: React.FC<{ filePath: string }> = ({ filePath }) 
   };
 
   const count = changes.length + binaryChanges.length;
-  if (!state || !available || loading || count === 0) return null;
+  if (!state || !available) return null;
+  // Sem is available but this file has no named changes (or is still
+  // resolving): show a disabled "sem 0" so every header carries the badge in
+  // the same spot — consistent look, aligned buttons, no popover.
+  if (loading || count === 0) {
+    return (
+      <span
+        className="semantic-file-badge semantic-file-badge-disabled"
+        title="No semantic changes in this file"
+        aria-disabled="true"
+      >
+        <span className="semantic-file-badge-label">sem</span>
+        <span className="semantic-file-badge-count">0</span>
+      </span>
+    );
+  }
 
   const openChange = (change: SemanticDiffChange) => {
     state.openDiffFile(change.filePath);

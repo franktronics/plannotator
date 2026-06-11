@@ -6,6 +6,7 @@ import { ConfirmDialog } from '@plannotator/ui/components/ConfirmDialog';
 import { Settings } from '@plannotator/ui/components/Settings';
 import { FeedbackButton, ApproveButton, ExitButton } from '@plannotator/ui/components/ToolbarButtons';
 import { AgentReviewActions } from './components/AgentReviewActions';
+import { DiffOptionsPopover } from './components/DiffOptionsPopover';
 import { useUpdateCheck } from '@plannotator/ui/hooks/useUpdateCheck';
 import { storage } from '@plannotator/ui/utils/storage';
 import { CompletionOverlay } from '@plannotator/ui/components/CompletionOverlay';
@@ -59,6 +60,7 @@ import { StackedPRLabel } from './components/StackedPRLabel';
 import { PRSelector } from './components/PRSelector';
 import { PRSwitchOverlay } from './components/PRSwitchOverlay';
 import { usePRStack } from './hooks/usePRStack';
+import { useDiffFreshness } from './hooks/useDiffFreshness';
 import { usePRSession, type PRSessionUpdate } from './hooks/usePRSession';
 import { useAnnotationFactory } from './hooks/useAnnotationFactory';
 import { DEMO_DIFF } from './demoData';
@@ -120,6 +122,11 @@ const ReviewApp: React.FC = () => {
   const [annotations, setAnnotations] = useState<CodeAnnotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [isAllFilesActive, setIsAllFilesActive] = useState(false);
+  // Mirror ref: handlers captured by Pierre slot portals (which only republish
+  // on item version bumps) and early-declared callbacks read the CURRENT value
+  // at call time instead of a stale closure capture.
+  const isAllFilesActiveRef = useRef(isAllFilesActive);
+  isAllFilesActiveRef.current = isAllFilesActive;
   const [isSemanticDiffActive, setIsSemanticDiffActive] = useState(false);
   const [semanticDiffAvailable, setSemanticDiffAvailable] = useState(false);
   const [isDiffPanelActive, setIsDiffPanelActive] = useState(false);
@@ -339,8 +346,18 @@ const ReviewApp: React.FC = () => {
   }, [dockApi, files]);
 
   const handleRevealSearchMatch = useCallback((match: ReviewSearchMatch) => {
+    // Respect the surface the user is in. When the all-files panel is active,
+    // reveal IN PLACE — AllFilesCodeView scrolls to + highlights the active
+    // match via the activeSearchMatch prop. When a single-file panel is active
+    // (or there's no dock yet), open the match's file there instead (legacy
+    // behavior). Unconditionally activating the all-files panel here would
+    // teleport the user out of their tab just for typing a query (reveal also
+    // fires on first-match auto-activation, not only on explicit clicks).
+    if (dockApi && isAllFilesActiveRef.current) {
+      return;
+    }
     openDiffFile(match.filePath);
-  }, [openDiffFile]);
+  }, [dockApi, openDiffFile]);
 
   const {
     searchQuery,
@@ -535,22 +552,34 @@ const ReviewApp: React.FC = () => {
     resetAISession();
   }, [aiProviders, origin, resetAISession]);
 
-  const handleAskAI = useCallback((question: string) => {
-    if (!pendingSelection || !files[activeFileIndex]) return;
+  // File-aware Ask AI: the all-files surface resolves the owning file itself
+  // (its toolbar selection lives in a file the single-file panel may never
+  // have focused), so it must NOT go through activeFileIndex.
+  const handleAskAIForFile = useCallback((filePath: string, question: string) => {
+    if (!pendingSelection) return;
+    const file = files.find(f => f.path === filePath);
+    if (!file) return;
     const lineStart = Math.min(pendingSelection.start, pendingSelection.end);
     const lineEnd = Math.max(pendingSelection.start, pendingSelection.end);
     const side = pendingSelection.side === 'additions' ? 'new' : 'old';
-    const selectedCode = extractLinesFromPatch(files[activeFileIndex].patch, lineStart, lineEnd, side);
+    const selectedCode = extractLinesFromPatch(file.patch, lineStart, lineEnd, side);
 
     askAI({
       prompt: question,
-      filePath: files[activeFileIndex].path,
+      filePath,
       lineStart,
       lineEnd,
       side,
       selectedCode: selectedCode || undefined,
     });
-  }, [activeFileIndex, askAI, files, pendingSelection]);
+  }, [askAI, files, pendingSelection]);
+
+  // Single-file surface: the focused file IS files[activeFileIndex].
+  const handleAskAI = useCallback((question: string) => {
+    const file = files[activeFileIndex];
+    if (!file) return;
+    handleAskAIForFile(file.path, question);
+  }, [activeFileIndex, files, handleAskAIForFile]);
 
   const handleViewAIResponse = useCallback((questionId?: string) => {
     reviewSidebar.open('ai');
@@ -571,10 +600,11 @@ const ReviewApp: React.FC = () => {
   }, [openDiffFile]);
 
 
-  // AI messages overlapping the current selection (for toolbar history)
-  const aiHistoryForSelection = useMemo(() => {
-    if (!pendingSelection || !files[activeFileIndex]) return [];
-    const filePath = files[activeFileIndex].path;
+  // AI messages overlapping the current selection in a GIVEN file (toolbar
+  // history). File-aware so the all-files surface can ask for its own active
+  // file instead of inheriting the single-file panel's focus.
+  const getAIHistoryForFile = useCallback((filePath: string) => {
+    if (!pendingSelection) return [];
     const selStart = Math.min(pendingSelection.start, pendingSelection.end);
     const selEnd = Math.max(pendingSelection.start, pendingSelection.end);
     const side = pendingSelection.side === 'additions' ? 'new' : 'old';
@@ -584,7 +614,13 @@ const ReviewApp: React.FC = () => {
         q.lineStart != null && q.lineEnd != null &&
         q.lineStart <= selEnd && q.lineEnd >= selStart;
     });
-  }, [pendingSelection, files, activeFileIndex, aiMessages]);
+  }, [pendingSelection, aiMessages]);
+
+  // Single-file surface variant (focused file = files[activeFileIndex]).
+  const aiHistoryForSelection = useMemo(() => {
+    const file = files[activeFileIndex];
+    return file ? getAIHistoryForFile(file.path) : [];
+  }, [files, activeFileIndex, getAIHistoryForFile]);
 
   // Click AI marker in diff → scroll sidebar to that Q&A
   const [scrollToQuestionId, setScrollToQuestionId] = useState<string | null>(null);
@@ -1095,18 +1131,21 @@ const ReviewApp: React.FC = () => {
     ));
   }, [updateExternalAnnotation, externalAnnotations]);
 
+  // selectedAnnotationId is cleared via a functional update (not a captured
+  // value): this handler is captured by Pierre slot portals (inline annotation
+  // delete buttons) that only republish on item version bumps — a closure over
+  // the state value goes stale and would leave a dangling selection id after
+  // deleting the currently-selected annotation.
   const handleDeleteAnnotation = useCallback((id: string) => {
     const ann = allAnnotationsRef.current.find(a => a.id === id);
     if (ann?.source && externalAnnotations.some(e => e.id === id)) {
       deleteExternalAnnotation(id);
-      if (selectedAnnotationId === id) setSelectedAnnotationId(null);
+      setSelectedAnnotationId(prev => (prev === id ? null : prev));
       return;
     }
     setAnnotations(prev => prev.filter(a => a.id !== id));
-    if (selectedAnnotationId === id) {
-      setSelectedAnnotationId(null);
-    }
-  }, [selectedAnnotationId, deleteExternalAnnotation, externalAnnotations]);
+    setSelectedAnnotationId(prev => (prev === id ? null : prev));
+  }, [deleteExternalAnnotation, externalAnnotations]);
 
   // Handle identity change - update author on existing annotations
   const handleIdentityChange = useCallback((oldIdentity: string, newIdentity: string) => {
@@ -1300,6 +1339,10 @@ const ReviewApp: React.FC = () => {
           setActiveFileIndex(0);
           openDiffFile(nextFiles[0].path);
         }
+        // Line numbers can shift when whitespace handling changes, so a
+        // selection anchored to the old patch is stale — clear it (the
+        // non-preserve branch below already does).
+        setPendingSelection(null);
       } else {
         dockApi?.getPanel(REVIEW_DIFF_PANEL_ID)?.api.close();
         needsInitialDiffPanel.current = true;
@@ -1417,7 +1460,34 @@ const ReviewApp: React.FC = () => {
     fetchDiffSwitch(diffType, selectedBase, { preserveFile: true });
   }, [diffHideWhitespace, origin, reviewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Select annotation - switches file if needed and scrolls to it
+  // --- Diff staleness ---------------------------------------------------------
+  // Files changing mid-review (an agent editing/committing while the user
+  // reviews) make the snapshot on screen stale. The hook polls the server's
+  // cheap fingerprint check; the toolbar shows a non-blocking notice and the
+  // user refreshes when THEY are ready — never automatically (annotations are
+  // line-anchored; rug-pulling the diff under them is worse than staleness).
+  const diffFreshness = useDiffFreshness({
+    enabled: !!origin,
+    resetKey: diffData?.rawPatch ?? '',
+  });
+
+  const handleRefreshStaleDiff = useCallback(() => {
+    if (prMetadata) {
+      // Only the full-stack scope can go stale locally — the layer diff is
+      // computed platform-side and its fingerprint never flips.
+      if (prDiffScope === 'full-stack') handlePRDiffScopeSelect('full-stack');
+      return;
+    }
+    // Same params, fresh snapshot. preserveFile keeps the reviewer on the
+    // file they were reading.
+    void fetchDiffSwitch(diffType, selectedBase, { preserveFile: true });
+  }, [prMetadata, prDiffScope, handlePRDiffScopeSelect, fetchDiffSwitch, diffType, selectedBase]);
+
+  // Select annotation - switches file if needed and scrolls to it.
+  // isAllFilesActive is read through the ref (declared with the state): this
+  // handler is baked into Pierre slot portals, which only republish on item
+  // version bumps — a stale captured value would yank the user out of the
+  // all-files tab into the single-file panel when they click an annotation.
   const handleSelectAnnotation = useCallback((id: string | null) => {
     if (!id) {
       setSelectedAnnotationId(null);
@@ -1425,7 +1495,7 @@ const ReviewApp: React.FC = () => {
     }
 
     // Find the annotation
-    const annotation = allAnnotations.find(a => a.id === id);
+    const annotation = allAnnotationsRef.current.find(a => a.id === id);
     if (!annotation) {
       setSelectedAnnotationId(id);
       return;
@@ -1433,7 +1503,7 @@ const ReviewApp: React.FC = () => {
 
     // In all-files mode, just set the selection — the panel's scroll-to-annotation
     // effect handles expanding and scrolling. In single-file mode, switch to the file.
-    if (!isAllFilesActive) {
+    if (!isAllFilesActiveRef.current) {
       const fileIndex = files.findIndex(f => f.path === annotation.filePath);
       if (fileIndex !== -1) {
         handleFileSwitch(fileIndex);
@@ -1441,7 +1511,7 @@ const ReviewApp: React.FC = () => {
     }
 
     setSelectedAnnotationId(id);
-  }, [allAnnotations, files, isAllFilesActive, handleFileSwitch]);
+  }, [files, handleFileSwitch]);
 
   // Diff context bundled into local-mode feedback headers so the receiving
   // agent knows which diff the annotations are anchored to. Uses committedBase
@@ -1524,13 +1594,17 @@ const ReviewApp: React.FC = () => {
     activeFileSearchMatches,
     activeSearchMatchId,
     activeSearchMatch: activeSearchMatch?.filePath === files[activeFileIndex]?.path ? activeSearchMatch : null,
+    searchMatches,
+    allFilesActiveSearchMatch: activeSearchMatch,
     aiAvailable,
     aiMessages,
     onAskAI: handleAskAI,
+    onAskAIForFile: handleAskAIForFile,
     isAILoading: aiIsCreatingSession || aiIsStreaming,
     onViewAIResponse: handleViewAIResponse,
     onClickAIMarker: handleClickAIMarker,
     aiHistoryForSelection,
+    getAIHistoryForFile,
     agentJobs: agentJobs.jobs,
     prMetadata,
     prContext,
@@ -1561,10 +1635,10 @@ const ReviewApp: React.FC = () => {
     handleSelectAnnotation, handleDeleteAnnotation, viewedFiles,
     handleToggleViewed, stagedFiles, stagingFile, stageFile,
     canStageFiles, stageError, isSearchPending, debouncedSearchQuery,
-    activeFileSearchMatches, activeSearchMatchId, activeSearchMatch,
+    activeFileSearchMatches, activeSearchMatchId, activeSearchMatch, searchMatches,
     aiAvailable, aiMessages, aiIsCreatingSession, aiIsStreaming,
-    handleAskAI, handleViewAIResponse, handleClickAIMarker,
-    aiHistoryForSelection, agentJobs.jobs, prMetadata, prContext,
+    handleAskAI, handleAskAIForFile, handleViewAIResponse, handleClickAIMarker,
+    aiHistoryForSelection, getAIHistoryForFile, agentJobs.jobs, prMetadata, prContext,
     isPRContextLoading, prContextError, fetchPRContext, platformUser, openDiffFile,
     handleOpenTour, isAllFilesActive, isSemanticDiffActive, semanticDiffAvailable,
     handleSemanticDiffUnavailable, handleSemanticDiffLoadError, handleSemanticDiffLoadSuccess, handleAddAnnotationForFile,
@@ -2100,6 +2174,31 @@ const ReviewApp: React.FC = () => {
                   </div>
                 )}
 
+                {/* Diff staleness notice — files changed since this snapshot
+                    was computed (agent editing mid-review). Non-blocking; the
+                    user refreshes when ready. */}
+                {diffFreshness.isStale && !isLoadingDiff && (
+                  <div className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300 px-2 py-1 bg-amber-500/10 rounded border border-amber-500/25">
+                    <span className="hidden md:inline">Diff out of date</span>
+                    <span className="md:hidden">Stale</span>
+                    <button
+                      onClick={handleRefreshStaleDiff}
+                      className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-100 transition-colors"
+                      title="Re-run the diff with the current settings"
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      onClick={diffFreshness.dismiss}
+                      className="text-amber-700/60 dark:text-amber-300/60 hover:text-amber-900 dark:hover:text-amber-100 transition-colors leading-none"
+                      title="Dismiss"
+                      aria-label="Dismiss stale diff notice"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+
                 {/* Agent mode: Close/SendFeedback flip + Approve */}
                 {!platformMode ? (
                   <AgentReviewActions
@@ -2181,6 +2280,11 @@ const ReviewApp: React.FC = () => {
                 )}
               </button>
             )}
+
+            {/* Global diff display options. These settings apply to every
+                file's diff, so they live once in the toolbar instead of being
+                repeated in every FileHeader. */}
+            <DiffOptionsPopover />
 
             <div className="w-px h-5 bg-border/50 mx-1 hidden md:block" />
 

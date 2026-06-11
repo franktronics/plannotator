@@ -449,12 +449,16 @@ diffs-container {
   padding: 0 0.5rem;
 }
 
-/* "sem · N" pill in a diff file header */
+/* "sem · N" pill in a diff file header. Fixed min-width (and a fixed-width
+   count, below) so 1- vs 2-digit counts — and files with no badge at all,
+   via the ghost — never skew the header button column across files. */
 .semantic-file-badge {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 0.3125rem;
   height: 1.5rem;
+  min-width: 4.125rem;
   padding: 0 0.4375rem;
   border: 0;
   border-radius: var(--radius-sm);
@@ -465,6 +469,19 @@ diffs-container {
   line-height: 1;
   cursor: pointer;
   transition: color 120ms ease, background 120ms ease;
+}
+
+/* Disabled "sem 0" badge for files with no semantic changes — same footprint
+   and structure as the live badge so every header looks consistent, but
+   grayed out and inert (no popover, no hover affordance). */
+.semantic-file-badge-disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.semantic-file-badge-disabled .semantic-file-badge-count {
+  background: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .semantic-file-badge:hover,
@@ -484,11 +501,13 @@ diffs-container {
 }
 
 .semantic-file-badge-count {
+  min-width: 1.5em;
   padding: 0.0625rem 0.3125rem;
   border-radius: calc(var(--radius-sm) - 2px);
   background: oklch(from var(--primary) l c h / 0.14);
   color: var(--primary);
   font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 /* Hover popover — same terminal rows as the panel, shadcn surface */

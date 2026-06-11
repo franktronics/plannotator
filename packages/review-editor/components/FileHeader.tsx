@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { DiffOptionsPopover } from './DiffOptionsPopover';
 import { SemanticFileBadge } from './SemanticFileBadge';
 
 interface FileHeaderProps {
@@ -13,6 +12,13 @@ interface FileHeaderProps {
   canStage?: boolean;
   stageError?: string | null;
   onFileComment?: (anchorEl: HTMLElement) => void;
+  /**
+   * Eager registration of the comment button element on mount/unmount (ref
+   * callback semantics: element on attach, null on detach). Lets keyboard
+   * shortcuts anchor the comment popover without the button ever being
+   * clicked. onFileComment alone only surfaces the element on click.
+   */
+  fileCommentButtonRef?: (el: HTMLButtonElement | null) => void;
   collapseToggle?: React.ReactNode;
   onCollapseToggle?: () => void;
 }
@@ -46,6 +52,7 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
   canStage = false,
   stageError,
   onFileComment,
+  fileCommentButtonRef,
   collapseToggle,
   onCollapseToggle,
 }) => {
@@ -163,7 +170,10 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
         )}
         {onFileComment && (
           <button
-            ref={fileCommentRef}
+            ref={(el) => {
+              fileCommentRef.current = el;
+              fileCommentButtonRef?.(el);
+            }}
             onClick={() => fileCommentRef.current && onFileComment(fileCommentRef.current)}
             className={`text-xs rounded transition-colors flex items-center text-muted-foreground hover:text-foreground hover:bg-muted ${commentLabel ? 'gap-1 px-2 py-1' : 'px-1.5 py-1'}`}
             title="Add file-scoped comment"
@@ -204,7 +214,6 @@ export const FileHeader: React.FC<FileHeaderProps> = ({
           )}
         </button>
         <SemanticFileBadge filePath={filePath} />
-        <DiffOptionsPopover />
       </div>
     </div>
   );

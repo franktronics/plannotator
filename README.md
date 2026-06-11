@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Everything you need to annotate and stay in the loop with your agents</strong><br/>
-  <strong>Doc Review • Code Review • HTML Artifacts</strong><br/>
+  <strong>Markdown Review • Code Review • HTML Artifacts</strong><br/>
   <sub>Annotate plans, specs, markdown, and HTML before implementation. Review diffs and PRs. Send feedback to your agent.</sub>
 </p>
 

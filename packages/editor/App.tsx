@@ -4,13 +4,15 @@ import { type Origin, getAgentName } from '@plannotator/shared/agents';
 import { parseMarkdownToBlocks, exportAnnotations, exportLinkedDocAnnotations, exportEditorAnnotations, exportCodeFileAnnotations, exportMessageAnnotations, extractFrontmatter, wrapFeedbackForAgent, Frontmatter, type LinkedDocAnnotationEntry, type MessageAnnotationEntry } from '@plannotator/ui/utils/parser';
 import { Viewer, ViewerHandle } from '@plannotator/ui/components/Viewer';
 import { HtmlViewer } from '@plannotator/ui/components/html-viewer';
+import { MarkdownEditor, type MarkdownEditorHandle } from '@plannotator/ui/components/MarkdownEditor';
+import { createTwoFilesPatch, structuredPatch } from 'diff';
 import { AnnotationPanel } from '@plannotator/ui/components/AnnotationPanel';
 import { DocumentAIChatPanel } from '@plannotator/ui/components/ai/DocumentAIChatPanel';
 import { SparklesIcon } from '@plannotator/ui/components/SparklesIcon';
 import { ExportModal } from '@plannotator/ui/components/ExportModal';
 import { ImportModal } from '@plannotator/ui/components/ImportModal';
 import { ConfirmDialog } from '@plannotator/ui/components/ConfirmDialog';
-import { Annotation, Block, EditorMode, type CodeAnnotation, type InputMethod, type ImageAttachment, type ActionsLabelMode } from '@plannotator/ui/types';
+import { Annotation, AnnotationType, Block, EditorMode, type CodeAnnotation, type InputMethod, type ImageAttachment, type ActionsLabelMode } from '@plannotator/ui/types';
 import { ThemeProvider } from '@plannotator/ui/components/ThemeProvider';
 import { Tooltip, TooltipProvider } from '@plannotator/ui/components/Tooltip';
 import { AnnotationToolstrip } from '@plannotator/ui/components/AnnotationToolstrip';
@@ -90,6 +92,7 @@ import {
 import type { GoalSetupBundle } from '@plannotator/shared/goal-setup';
 import type { AIContext } from '@plannotator/ai';
 import type { CommentAskAIContext } from '@plannotator/ui/components/CommentPopover';
+import type { SourceSaveCapability, SourceSaveResponse } from '@plannotator/shared/source-save';
 // Demo content toggle. Default: the original Real-time Collaboration plan.
 // Opt-in diff-engine stress test: `VITE_DIFF_DEMO=1 bun run dev:hook` swaps
 // in the 20-case Auth Service Refactor test plan. dev-mock-api.ts reads the
@@ -105,6 +108,14 @@ const DEMO_PLAN_CONTENT = USE_DIFF_DEMO
   : DEFAULT_DEMO_PLAN_CONTENT;
 import { useCheckboxOverrides } from './hooks/useCheckboxOverrides';
 import { AppHeader } from './components/AppHeader';
+import {
+  buildDirectEditsSection,
+  buildSavedFileChangesSection,
+  buildSourceFileDirectEditsSection,
+  composeFeedbackWithEditSections,
+  normalizeEditedMarkdown,
+} from './directEdits';
+import { editableDocumentKey, useEditableDocuments } from './editableDocuments';
 
 type NoteAutoSaveResults = {
   obsidian?: boolean;
@@ -188,14 +199,48 @@ const buildMessageAnnotationCounts = (
   return counts;
 };
 
+// Line-level +/- counts for the edit-mode badge. structuredPatch is the same
+// engine (diff@8) that powers planDiffEngine; counting hunk lines is cheap.
+const computeEditStats = (base: string, edited: string): { added: number; removed: number } => {
+  const patch = structuredPatch('plan.md', 'plan.md', base, edited, undefined, undefined, { context: 0 });
+  let added = 0;
+  let removed = 0;
+  for (const hunk of patch.hunks) {
+    for (const line of hunk.lines) {
+      if (line.startsWith('+')) added++;
+      else if (line.startsWith('-')) removed++;
+    }
+  }
+  return { added, removed };
+};
+
+const draftBannerMessage = (banner: { count: number; timeAgo: string; hasEdits: boolean }): string => {
+  const parts = [
+    banner.count > 0 ? `${banner.count} annotation${banner.count !== 1 ? 's' : ''}` : '',
+    banner.hasEdits ? 'unsent direct edits' : '',
+  ].filter(Boolean);
+  return `Found ${parts.join(' and ')} from ${banner.timeAgo}. Would you like to restore them?`;
+};
+
+const feedbackLossDescription = (annotationCount: number, hasDirectEdits: boolean): string => {
+  const parts = [
+    annotationCount > 0 ? `${annotationCount} annotation${annotationCount !== 1 ? 's' : ''}` : '',
+    hasDirectEdits ? 'direct edits' : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' and ') : 'feedback';
+};
+
 const App: React.FC = () => {
   const [markdown, setMarkdown] = useState(DEMO_PLAN_CONTENT);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [codeAnnotations, setCodeAnnotations] = useState<CodeAnnotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [selectedCodeAnnotationId, setSelectedCodeAnnotationId] = useState<string | null>(null);
-  const frontmatter = useMemo(() => extractFrontmatter(markdown).frontmatter, [markdown]);
-  const blocks = useMemo(() => parseMarkdownToBlocks(markdown), [markdown]);
+  const editableDocuments = useEditableDocuments();
+  const activeEditableDocument = editableDocuments.activeDocument;
+  const displayedMarkdown = activeEditableDocument?.currentText ?? markdown;
+  const frontmatter = useMemo(() => extractFrontmatter(displayedMarkdown).frontmatter, [displayedMarkdown]);
+  const blocks = useMemo(() => parseMarkdownToBlocks(displayedMarkdown), [displayedMarkdown]);
   const [showExport, setShowExport] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showFeedbackPrompt, setShowFeedbackPrompt] = useState(false);
@@ -249,6 +294,27 @@ const App: React.FC = () => {
       return () => clearTimeout(t);
     }
   }, [updateInfo?.updateAvailable, updateInfo?.dismissed]);
+  // Markdown edit mode (prototype): CM6 live-preview editor over the raw plan
+  // text. originalMarkdownRef is the as-submitted baseline for the edit diff —
+  // set once at plan load, never by linked-doc navigation or edit commits.
+  const [isEditingMarkdown, setIsEditingMarkdown] = useState(false);
+  const [editStats, setEditStats] = useState<{ added: number; removed: number } | null>(null);
+  // Bumped on every edit commit so the Viewer remounts: web-highlighter mutates
+  // the Viewer DOM, and reconciling changed blocks against the old subtree throws.
+  const [editGeneration, setEditGeneration] = useState(0);
+  // True while the open editor buffer differs from what it mounted with.
+  const [editorDirty, setEditorDirty] = useState(false);
+  // True while the open editor buffer differs from the as-submitted baseline.
+  const [editorDiffersFromBaseline, setEditorDiffersFromBaseline] = useState(false);
+  const originalMarkdownRef = useRef<string | null>(null);
+  // Last COMMITTED editor text (null = no edits). The Direct Edits diff reads
+  // this — never the shared `markdown` state, which linked-doc navigation,
+  // message switching, and checkbox toggles repurpose.
+  const editedMarkdownRef = useRef<string | null>(null);
+  // What the current edit session mounted with, for live dirty tracking.
+  const editSessionBaseRef = useRef<string>('');
+  const markdownEditorHandleRef = useRef<MarkdownEditorHandle | null>(null);
+  const suspendedRootEditableKeyRef = useRef<string | null>(null);
   const [globalAttachments, setGlobalAttachments] = useState<ImageAttachment[]>([]);
   const [annotateMode, setAnnotateMode] = useState(false);
   const [gate, setGate] = useState(false);
@@ -489,6 +555,27 @@ const App: React.FC = () => {
 
   // Plan diff computation
   const planDiff = usePlanDiff(markdown, previousPlan, versionInfo);
+  const warnFinishEditingFirst = useCallback((target: 'versions' | 'diff') => {
+    toast('Finish editing first', {
+      description: target === 'versions'
+        ? 'Use "Done editing" before changing the comparison version.'
+        : 'Use "Done editing" before opening the version diff.',
+    });
+  }, []);
+  const handleSelectBaseVersion = useCallback((version: number) => {
+    if (isEditingMarkdown) {
+      warnFinishEditingFirst('versions');
+      return Promise.resolve();
+    }
+    return planDiff.selectBaseVersion(version);
+  }, [isEditingMarkdown, planDiff.selectBaseVersion, warnFinishEditingFirst]);
+  const handleActivatePlanDiff = useCallback(() => {
+    if (isEditingMarkdown) {
+      warnFinishEditingFirst('diff');
+      return;
+    }
+    setIsPlanDiffActive(true);
+  }, [isEditingMarkdown, warnFinishEditingFirst]);
 
   const linkedDocSidebar = useMemo(() => ({
     ...sidebar,
@@ -502,12 +589,65 @@ const App: React.FC = () => {
     toggleSidebarTab,
   ]);
 
+  const snapshotActiveEditableDocument = useCallback(() => {
+    if (!activeEditableDocument) return;
+    if (isEditingMarkdown) {
+      const live = markdownEditorHandleRef.current?.getMarkdown();
+      if (live != null) editableDocuments.updateActiveText(live, { forceNotify: true });
+      return;
+    }
+    editableDocuments.updateActiveText(displayedMarkdown, { forceNotify: true });
+  }, [activeEditableDocument, displayedMarkdown, editableDocuments, isEditingMarkdown]);
+
+  const getLinkedDocumentMarkdown = useCallback((filepath: string, fallback?: string) => {
+    return editableDocuments.getCurrentText(`file:${filepath}`) ?? fallback;
+  }, [editableDocuments]);
+
+  const restoreLinkedDocumentEditableKey = useCallback(() => {
+    const restoreKey = suspendedRootEditableKeyRef.current;
+    suspendedRootEditableKeyRef.current = null;
+    editableDocuments.setActiveKey(restoreKey);
+  }, [editableDocuments]);
+
+  const handleLinkedDocumentLoaded = useCallback((doc: { markdown?: string; filepath?: string; renderAs?: 'markdown' | 'html'; sourceSave?: SourceSaveCapability }) => {
+    if (annotateSource !== 'folder') {
+      if (activeEditableDocument?.sourceSave?.enabled) {
+        suspendedRootEditableKeyRef.current = activeEditableDocument.key;
+        editableDocuments.setActiveKey(null);
+      }
+      return undefined;
+    }
+
+    if (doc.renderAs === 'html' || !doc.filepath || doc.markdown == null) {
+      editableDocuments.setActiveKey(null);
+      return undefined;
+    }
+
+    const sourceSave = doc.sourceSave ?? null;
+    const key = editableDocumentKey(sourceSave, `file:${doc.filepath}`);
+    editableDocuments.openDocument({ key, text: doc.markdown, sourceSave });
+    const currentText = editableDocuments.getCurrentText(key) ?? doc.markdown;
+    const record = editableDocuments.getDocument(key);
+
+    if (isEditingMarkdown) {
+      editSessionBaseRef.current = currentText;
+      setEditorDirty(false);
+      setEditorDiffersFromBaseline(record ? currentText !== record.diskBaseline : false);
+    }
+
+    return currentText;
+  }, [activeEditableDocument, annotateSource, editableDocuments, isEditingMarkdown]);
+
   // Linked document navigation
   const linkedDocHook = useLinkedDoc({
     markdown, annotations, selectedAnnotationId, globalAttachments,
     setMarkdown, setAnnotations, setSelectedAnnotationId, setGlobalAttachments,
     renderAs, rawHtml, shareHtml, setRenderAs, setRawHtml, setShareHtml,
     viewerRef, sidebar: linkedDocSidebar, sourceFilePath, sourceConverted,
+    onBeforeNavigate: snapshotActiveEditableDocument,
+    onDocumentLoaded: handleLinkedDocumentLoaded,
+    getDocumentMarkdown: getLinkedDocumentMarkdown,
+    onAfterBack: restoreLinkedDocumentEditableKey,
   });
 
   // Active document's directory — feeds both click-time popout fetches and
@@ -758,9 +898,14 @@ const App: React.FC = () => {
   // Wrap linked doc back to also clear file browser active file
   const handleLinkedDocBack = React.useCallback(() => {
     linkedDocHook.back();
+    if (isEditingMarkdown) {
+      setIsEditingMarkdown(false);
+      setEditorDirty(false);
+      setEditorDiffersFromBaseline(false);
+    }
     fileBrowser.setActiveFile(null);
     archive.clearSelection();
-  }, [linkedDocHook, fileBrowser, archive]);
+  }, [linkedDocHook, isEditingMarkdown, fileBrowser, archive]);
 
   // Derive annotation counts per file from linked doc cache (includes active doc's live state)
   const allAnnotationCounts = useMemo(() => {
@@ -835,7 +980,7 @@ const App: React.FC = () => {
     ? `doc:${linkedDocHook.filepath}`
     : annotateSource === 'message' && selectedMessageId
       ? `msg:${selectedMessageId}`
-      : 'plan';
+      : `plan:${editGeneration}`;
 
   // Track active section for TOC highlighting
   const headingCount = useMemo(() => blocks.filter(b => b.type === 'heading').length, [blocks]);
@@ -850,7 +995,7 @@ const App: React.FC = () => {
   const { reset: resetExternalHighlights } = useExternalAnnotationHighlights({
     viewerRef,
     externalAnnotations,
-    enabled: isApiMode && !goalSetupMode && !linkedDocHook.isActive && !isPlanDiffActive,
+    enabled: isApiMode && !goalSetupMode && !linkedDocHook.isActive && !isPlanDiffActive && !isEditingMarkdown,
     planKey: markdown,
   });
 
@@ -1017,28 +1162,43 @@ const App: React.FC = () => {
     return () => ro.disconnect();
   }, [isLoading, isSharedSession]);
 
+  // The user's current direct-edit text: the open editor buffer, else the
+  // last commit; null when there is none or it matches the baseline. Never
+  // the shared `markdown` state, which linked docs, message switching, and
+  // checkbox toggles legitimately mutate. Feeds both the draft auto-save and
+  // the Direct Edits feedback section.
+  const getEditedMarkdown = useCallback((): string | null => {
+    const activeDocument = editableDocuments.getActiveDocumentLive();
+    if (activeDocument?.sourceSave?.enabled) {
+      const live = isEditingMarkdown ? markdownEditorHandleRef.current?.getMarkdown() : null;
+      return normalizeEditedMarkdown(activeDocument.diskBaseline, live ?? activeDocument.currentText);
+    }
+
+    const base = originalMarkdownRef.current;
+    if (base === null) return null;
+    const live = isEditingMarkdown ? markdownEditorHandleRef.current?.getMarkdown() : null;
+    return normalizeEditedMarkdown(base, live ?? editedMarkdownRef.current);
+  }, [editableDocuments, isEditingMarkdown]);
+
+  const getDraftEditedMarkdown = useCallback((): string | null => {
+    if (editableDocuments.getActiveDocumentLive()?.sourceSave?.enabled) return null;
+    return getEditedMarkdown();
+  }, [editableDocuments, getEditedMarkdown]);
+
   // Auto-save annotation drafts
-  const { draftBanner, restoreDraft, dismissDraft } = useAnnotationDraft({
+  const { draftBanner, restoreDraft, scheduleDraftSave, dismissDraft } = useAnnotationDraft({
     annotations: allAnnotations,
     codeAnnotations,
     globalAttachments,
+    getEditedMarkdown: getDraftEditedMarkdown,
+    getEditedDocuments: editableDocuments.getDraftDocuments,
     isApiMode: isApiMode && !goalSetupMode,
     isSharedSession,
-    submitted: !!submitted,
+    // isSubmitting counts: a save firing while approve/deny is in flight can
+    // land after the server's draft delete and ghost a "Draft Recovered"
+    // banner into the next session for this plan. Saving resumes if it fails.
+    submitted: !!submitted || isSubmitting,
   });
-
-  const handleRestoreDraft = React.useCallback(() => {
-    const { annotations: restored, codeAnnotations: restoredCode, globalAttachments: restoredGlobal } = restoreDraft();
-    if (restored.length > 0 || restoredCode.length > 0 || restoredGlobal.length > 0) {
-      setAnnotations(restored);
-      setCodeAnnotations(restoredCode);
-      if (restoredGlobal.length > 0) setGlobalAttachments(restoredGlobal);
-      // Apply highlights to DOM after a tick
-      setTimeout(() => {
-        viewerRef.current?.applySharedAnnotations(restored.filter(a => !a.diffContext));
-      }, 100);
-    }
-  }, [restoreDraft]);
 
   // Fetch available agents for OpenCode (for validation on approve)
   const { agents: availableAgents, validateAgent, getAgentWarning } = useAgents(origin);
@@ -1059,6 +1219,404 @@ const App: React.FC = () => {
       return () => clearTimeout(timer);
     }
   }, [pendingSharedAnnotations, clearPendingSharedAnnotations, resetExternalHighlights]);
+
+  // Markdown edit mode: single consolidated gate. The editor only ever opens on
+  // the main plan/file markdown — never on HTML surfaces, archive/goal-setup
+  // views, linked docs, messages, folder pickers, diff view, or shared sessions.
+  const canEditMarkdown =
+    renderAs !== 'html' &&
+    // editStats non-null keeps the toggle available after committing an
+    // emptied document, so the user can re-enter and undo. Source-backed files
+    // are editable even when they start empty.
+    (activeEditableDocument?.sourceSave?.enabled || displayedMarkdown !== '' || editStats !== null) &&
+    !archive.archiveMode &&
+    !goalSetupMode &&
+    (!linkedDocHook.isActive || (annotateSource === 'folder' && activeEditableDocument?.sourceSave?.enabled)) &&
+    !isPlanDiffActive &&
+    !isSharedSession &&
+    annotateSource !== 'message' &&
+    !submitted;
+
+  // Swap the document to `next` and re-resolve annotation block anchors against
+  // the new parse so exported line labels don't point at stale content.
+  // Annotations whose text no longer exists get blockId '' — exportAnnotations
+  // omits the line label instead of emitting a wrong one. Returns the remapped
+  // objects so callers repaint THOSE, not the pre-remap ones (whose stale
+  // startMeta/endMeta would let fromStore() silently highlight wrong content).
+  // `list` defaults to current state; draft restore passes the restored set,
+  // which isn't in state yet when the remap runs.
+  const applyEditedDocument = useCallback((next: string, list: Annotation[] = annotations): Annotation[] => {
+    const newBlocks = parseMarkdownToBlocks(next);
+    const remapped = list.map((a) => {
+      if (a.diffContext || a.type === AnnotationType.GLOBAL_COMMENT || a.id.startsWith('ann-checkbox-')) return a;
+      const blk = newBlocks.find((b) => b.content.includes(a.originalText));
+      if ((blk?.id ?? '') === a.blockId) return a;
+      // Block moved: also strip startMeta/endMeta — fromStore() anchors by
+      // positional parent index without validating text. Text-search is safe.
+      return { ...a, blockId: blk?.id ?? '', startMeta: undefined, endMeta: undefined };
+    });
+    setMarkdown(next);
+    setEditGeneration((g) => g + 1);
+    setAnnotations(remapped);
+    return remapped;
+  }, [annotations]);
+
+  // The Viewer is remounted after every edit-mode exit (it was unmounted while
+  // editing), so highlight DOM is rebuilt from scratch. Re-anchor via the same
+  // text-search restore used by draft/share/linked-doc flows, then report
+  // annotations whose text vanished. resetExternalHighlights repaints live SSE
+  // annotation highlights the same way the share-import path does.
+  const repaintHighlights = useCallback((list: Annotation[]) => {
+    resetExternalHighlights();
+    const planAnnotations = list.filter(
+      (a) => !a.diffContext && a.type !== AnnotationType.GLOBAL_COMMENT && !a.id.startsWith('ann-checkbox-')
+    );
+    if (planAnnotations.length === 0) return;
+    setTimeout(() => {
+      viewerRef.current?.applySharedAnnotations(planAnnotations);
+      // web-highlighter restores use data-highlight-id; manual code-block
+      // wraps use data-bind-id. Either counts as present.
+      const missing = planAnnotations.filter(
+        (a) => !document.querySelector(`[data-bind-id="${a.id}"], [data-highlight-id="${a.id}"]`)
+      );
+      if (missing.length > 0) {
+        toast(`${missing.length} annotation${missing.length === 1 ? '' : 's'} no longer match the text`, {
+          description: 'The highlighted text was edited. They remain listed in the panel.',
+          duration: 5000,
+        });
+      }
+    }, 120);
+  }, [resetExternalHighlights]);
+
+  // Commits the open editor buffer: updates markdown state, records the edit
+  // for the Direct Edits diff, re-anchors annotations, repaints highlights.
+  const commitMarkdownEdits = useCallback(() => {
+    if (!isEditingMarkdown) return;
+    const edited = markdownEditorHandleRef.current?.getMarkdown();
+    setIsEditingMarkdown(false);
+    setEditorDirty(false);
+    setEditorDiffersFromBaseline(false);
+
+    const base = originalMarkdownRef.current;
+    if (edited != null) {
+      if (activeEditableDocument?.sourceSave?.enabled) {
+        editableDocuments.updateActiveText(edited, { forceNotify: true });
+        const sourceEdited = normalizeEditedMarkdown(activeEditableDocument.diskBaseline, edited);
+        editedMarkdownRef.current = null;
+        setEditStats(sourceEdited !== null ? computeEditStats(activeEditableDocument.diskBaseline, sourceEdited) : null);
+        if (sourceEdited !== null && window.innerWidth >= 768) {
+          setRightSidebarTab('annotations');
+          setIsPanelOpen(true);
+        }
+      } else {
+        const normalizedEdited = normalizeEditedMarkdown(base, edited);
+        editedMarkdownRef.current = normalizedEdited;
+        setEditStats(base !== null && normalizedEdited !== null ? computeEditStats(base, normalizedEdited) : null);
+        // Surface the Direct Edits card so the user sees where their changes went.
+        if (base !== null && normalizedEdited !== null && window.innerWidth >= 768) {
+          setRightSidebarTab('annotations');
+          setIsPanelOpen(true);
+        }
+      }
+    }
+
+    const renderedBaseline = activeEditableDocument?.sourceSave?.enabled ? markdown : displayedMarkdown;
+    const remapped = edited != null && edited !== renderedBaseline ? applyEditedDocument(edited) : annotations;
+    repaintHighlights(remapped);
+    scheduleDraftSave();
+  }, [activeEditableDocument, displayedMarkdown, editableDocuments, isEditingMarkdown, annotations, markdown, applyEditedDocument, repaintHighlights, scheduleDraftSave]);
+
+  // Discards direct edits for one document. Source-backed folder edits are
+  // file-scoped; normal plan-review edits still have a single document.
+  const handleDiscardEdits = useCallback((sourceKey?: string) => {
+    const targetKey = sourceKey ?? activeEditableDocument?.key;
+    const targetIsActive = !!targetKey && editableDocuments.getActiveKey() === targetKey;
+    const targetRecord = targetKey ? editableDocuments.getDocument(targetKey) : null;
+    if (sourceKey && !targetRecord?.sourceSave?.enabled) return;
+
+    if (targetKey && targetRecord?.sourceSave?.enabled) {
+      const discarded = editableDocuments.discardDocument(targetKey);
+      if (!discarded) return;
+      if (!targetIsActive) {
+        scheduleDraftSave();
+        return;
+      }
+
+      setIsEditingMarkdown(false);
+      setEditorDirty(false);
+      setEditorDiffersFromBaseline(false);
+      editedMarkdownRef.current = null;
+      setEditStats(null);
+      const remapped = displayedMarkdown !== discarded.diskBaseline
+        ? applyEditedDocument(discarded.diskBaseline)
+        : annotations;
+      repaintHighlights(remapped);
+      scheduleDraftSave();
+      return;
+    }
+
+    const base = originalMarkdownRef.current;
+    if (base === null) return;
+    setIsEditingMarkdown(false);
+    setEditorDirty(false);
+    setEditorDiffersFromBaseline(false);
+    editedMarkdownRef.current = null;
+    setEditStats(null);
+    const remapped = markdown !== base ? applyEditedDocument(base) : annotations;
+    repaintHighlights(remapped);
+    scheduleDraftSave();
+  }, [activeEditableDocument, editableDocuments, displayedMarkdown, markdown, annotations, applyEditedDocument, repaintHighlights, scheduleDraftSave]);
+
+  // Restores a recovered draft: annotations always; direct edits when present
+  // and the baseline exists. Edits flow through the same helpers
+  // commitMarkdownEdits uses, with the RESTORED annotations remapped against
+  // the edited document (they aren't in state yet when the remap runs).
+  const handleRestoreDraft = React.useCallback(() => {
+    const {
+      annotations: restored,
+      codeAnnotations: restoredCode,
+      globalAttachments: restoredGlobal,
+      editedMarkdown,
+      editedDocuments,
+    } = restoreDraft();
+    if (restoredCode.length > 0) setCodeAnnotations(restoredCode);
+    if (restoredGlobal.length > 0) setGlobalAttachments(restoredGlobal);
+
+    if (editedDocuments.length > 0) {
+      if (isEditingMarkdown) {
+        toast('Draft file edits were not restored', {
+          description: 'You already have edits in this session — those take precedence.',
+          duration: 5000,
+        });
+      } else {
+        editableDocuments.restoreDraftDocuments(editedDocuments);
+        const activeDraft = activeEditableDocument?.sourceSave?.enabled
+          ? editedDocuments.find((doc) => doc.key === activeEditableDocument.key)
+          : undefined;
+        if (activeDraft && activeDraft.currentText !== markdown) {
+          const remapped = applyEditedDocument(activeDraft.currentText, restored);
+          repaintHighlights(remapped);
+          if (activeDraft.currentText !== activeDraft.diskBaseline) {
+            setEditStats(computeEditStats(activeDraft.diskBaseline, activeDraft.currentText));
+            if (window.innerWidth >= 768) {
+              setRightSidebarTab('annotations');
+              setIsPanelOpen(true);
+            }
+          }
+          return;
+        }
+      }
+    }
+
+    // CRLF normalize is insurance against a hand-edited draft file — a \r
+    // here would fabricate a whole-document diff against the LF baseline.
+    const base = originalMarkdownRef.current;
+    const edited = editedMarkdown !== null ? editedMarkdown.replace(/\r\n?/g, '\n') : null;
+    // editStats/isEditingMarkdown guards are defensive: the restore dialog is
+    // modal on load, so live edits can't exist yet — but if they ever do,
+    // the user's current work wins over the draft.
+    if (edited !== null && base !== null && edited !== base && editStats === null && !isEditingMarkdown) {
+      editedMarkdownRef.current = edited;
+      setEditorDiffersFromBaseline(false);
+      setEditStats(computeEditStats(base, edited));
+      if (window.innerWidth >= 768) {
+        setRightSidebarTab('annotations');
+        setIsPanelOpen(true);
+      }
+      const remapped = applyEditedDocument(edited, restored);
+      repaintHighlights(remapped);
+      return;
+    }
+    if (edited !== null && (editStats !== null || isEditingMarkdown)) {
+      // Skipped, not silently dropped: the user started editing before the
+      // (late) draft banner was answered. Their live work wins.
+      toast('Draft edits were not restored', {
+        description: 'You already have edits in this session — those take precedence.',
+        duration: 5000,
+      });
+    }
+
+    if (restored.length > 0) {
+      setAnnotations(restored);
+      // Apply highlights to DOM after a tick
+      setTimeout(() => {
+        viewerRef.current?.applySharedAnnotations(restored.filter(a => !a.diffContext));
+      }, 100);
+    }
+  }, [restoreDraft, editStats, isEditingMarkdown, editableDocuments, activeEditableDocument, markdown, applyEditedDocument, repaintHighlights]);
+
+  const handleEditToggle = useCallback(() => {
+    if (isEditingMarkdown) {
+      commitMarkdownEdits();
+      return;
+    }
+    // Normalize CRLF before it becomes a baseline (e.g. share-imported content) —
+    // CM6 emits \n-joined text, and a CRLF baseline would fabricate a full diff.
+    const normalized = displayedMarkdown.includes('\r') ? displayedMarkdown.replace(/\r\n?/g, '\n') : displayedMarkdown;
+    if (normalized !== displayedMarkdown) {
+      if (activeEditableDocument?.sourceSave?.enabled) {
+        editableDocuments.updateActiveText(normalized, { forceNotify: true });
+      } else {
+        setMarkdown(normalized);
+      }
+    }
+    // Safety net for paths that loaded content without setting the baseline.
+    if (originalMarkdownRef.current === null) originalMarkdownRef.current = normalized;
+    const base = originalMarkdownRef.current;
+    editSessionBaseRef.current = normalized;
+    if (activeEditableDocument?.sourceSave?.enabled) {
+      editableDocuments.beginEdit(normalized);
+    }
+    setEditorDirty(false);
+    setEditorDiffersFromBaseline(
+      activeEditableDocument?.sourceSave?.enabled
+        ? normalized !== activeEditableDocument.diskBaseline
+        : base !== null && normalized !== base
+    );
+    setIsEditingMarkdown(true);
+  }, [activeEditableDocument, displayedMarkdown, editableDocuments, isEditingMarkdown, commitMarkdownEdits]);
+
+  // Live dirty tracking for the open editor session. String compare per
+  // keystroke is fine at plan sizes; setState bails out on unchanged values.
+  const handleEditorChange = useCallback((md: string) => {
+    setEditorDirty(md !== editSessionBaseRef.current);
+    if (activeEditableDocument?.sourceSave?.enabled) {
+      editableDocuments.updateActiveText(md);
+      setEditorDiffersFromBaseline(md !== activeEditableDocument.diskBaseline);
+    } else {
+      const base = originalMarkdownRef.current;
+      setEditorDiffersFromBaseline(base !== null && md !== base);
+    }
+    // Mid-edit keystrokes persist too — a crash loses at most the debounce
+    // window. The hook reads the live buffer via getDraftEditedMarkdown.
+    scheduleDraftSave();
+  }, [activeEditableDocument, editableDocuments, scheduleDraftSave]);
+
+  const unsavedEditableDocuments = useMemo(
+    () => editableDocuments.getUnsavedDocuments(),
+    [editableDocuments, editableDocuments.version],
+  );
+  const savedFileChanges = useMemo(
+    () => editableDocuments.getSavedFileChanges(),
+    [editableDocuments, editableDocuments.version],
+  );
+  const activeSourceSave = activeEditableDocument?.sourceSave?.enabled
+    ? activeEditableDocument.sourceSave
+    : null;
+
+  // True when there is anything the Direct Edits diff would carry.
+  const hasSourceBackedDirectEdits = unsavedEditableDocuments.length > 0;
+  const hasDirectEdits = hasSourceBackedDirectEdits
+    ? true
+    : isEditingMarkdown ? editorDiffersFromBaseline : editedMarkdownRef.current !== null;
+  const hasSavedFileChanges = savedFileChanges.length > 0;
+  const hasFeedbackToSend = hasAnyAnnotations || hasDirectEdits || hasSavedFileChanges;
+  const feedbackLoss = feedbackLossDescription(feedbackAnnotationCount, hasDirectEdits);
+  const hasUnsentFeedback = feedbackAnnotationCount > 0 || hasDirectEdits;
+  const hasOnlySavedFileChanges = hasSavedFileChanges && !hasUnsentFeedback;
+  const savedFileChangesLabel = savedFileChanges.length === 1 ? 'saved file change' : 'saved file changes';
+  const savedFileChangesVerb = savedFileChanges.length === 1 ? 'is' : 'are';
+  const savedFileChangesPronoun = savedFileChanges.length === 1 ? 'it' : 'them';
+  const savedFileChangesOnDiskMessage = <>Your {savedFileChangesLabel} {savedFileChangesVerb} already on disk.</>;
+  const savedFileAwarenessOnlyMessage = <>{savedFileChangesOnDiskMessage} The agent won't be told about {savedFileChangesPronoun}.</>;
+  const savedFileAwarenessMixedMessage = hasSavedFileChanges
+    ? <> Your {savedFileChangesLabel} will stay on disk, but the agent won't be told about {savedFileChangesPronoun}.</>
+    : null;
+
+  // Pinned "Direct edits" card data for the annotation sidebar. Source-backed
+  // folder edits render one card per dirty file so discard is file-scoped.
+  const directEditsPanelInfo = useMemo(() => {
+    if (unsavedEditableDocuments.length > 0) {
+      return unsavedEditableDocuments.map((record) => {
+        const stats = computeEditStats(record.diskBaseline, record.currentText);
+        return {
+          id: record.key,
+          sourceKey: record.key,
+          label: record.path ?? record.basename,
+          added: stats.added,
+          removed: stats.removed,
+          diffText: createTwoFilesPatch(
+            `${record.path ?? record.basename} (saved)`,
+            `${record.path ?? record.basename} (edited)`,
+            record.diskBaseline,
+            record.currentText,
+            undefined,
+            undefined,
+            { context: 3 },
+          ).trimEnd(),
+        };
+      });
+    }
+
+    if (!editStats) return null;
+    if (activeEditableDocument?.sourceSave?.enabled) {
+      const edited = activeEditableDocument.currentText;
+      const base = activeEditableDocument.diskBaseline;
+      if (edited === base) return null;
+      return [{
+        id: activeEditableDocument.key,
+        sourceKey: activeEditableDocument.key,
+        label: activeEditableDocument.path ?? activeEditableDocument.basename,
+        added: editStats.added,
+        removed: editStats.removed,
+        diffText: createTwoFilesPatch(
+          `${activeEditableDocument.basename} (saved)`,
+          `${activeEditableDocument.basename} (edited)`,
+          base,
+          edited,
+          undefined,
+          undefined,
+          { context: 3 },
+        ),
+      }];
+    }
+    const base = originalMarkdownRef.current;
+    const edited = editedMarkdownRef.current;
+    if (base === null || edited === null) return null;
+    return [{
+      id: 'plan',
+      added: editStats.added,
+      removed: editStats.removed,
+      diffText: createTwoFilesPatch('plan.md (original)', 'plan.md (edited)', base, edited, undefined, undefined, { context: 3 }),
+    }];
+  }, [activeEditableDocument, editStats, unsavedEditableDocuments]);
+
+  // "Direct Edits" feedback section: unified diff of user edits vs the
+  // as-submitted baseline. getEditedMarkdown owns the read discipline.
+  const buildEditsSection = useCallback((): string => {
+    const sourceBackedEdits = editableDocuments.getUnsavedDocuments();
+    if (sourceBackedEdits.length > 0) {
+      return buildSourceFileDirectEditsSection(
+        sourceBackedEdits.map((record) => ({
+          path: record.path ?? record.basename,
+          basename: record.basename,
+          base: record.diskBaseline,
+          current: record.currentText,
+        })),
+      );
+    }
+
+    const base = originalMarkdownRef.current;
+    return buildDirectEditsSection(base, getEditedMarkdown(), sourceConverted);
+  }, [editableDocuments, getEditedMarkdown, sourceConverted]);
+
+  const buildSavedChangesSection = useCallback((): string => {
+    return buildSavedFileChangesSection(
+      savedFileChanges.map((change) => ({
+        path: change.path,
+        basename: change.basename,
+        beforeText: change.beforeText,
+        afterText: change.afterText,
+      })),
+    );
+  }, [savedFileChanges]);
+
+  // Prepends the Direct Edits section to annotation feedback. When edits exist
+  // but there are no annotations, the "no feedback" sentinel is replaced rather
+  // than appended to.
+  const composeFeedback = useCallback((annotationsText: string): string => {
+    return composeFeedbackWithEditSections(annotationsText, buildEditsSection(), buildSavedChangesSection());
+  }, [buildEditsSection, buildSavedChangesSection]);
 
   const handleTaterModeChange = useCallback((enabled: boolean) => {
     setTaterMode(enabled);
@@ -1089,7 +1647,7 @@ const App: React.FC = () => {
         if (!res.ok) throw new Error('Not in API mode');
         return res.json();
       })
-      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; sourceInfo?: string; sourceConverted?: boolean; gate?: boolean; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[] }) => {
+      .then((data: { plan: string; origin?: Origin; mode?: 'annotate' | 'annotate-last' | 'annotate-folder' | 'archive' | 'goal-setup'; goalSetup?: GoalSetupBundle; filePath?: string; sourceInfo?: string; sourceConverted?: boolean; sourceSave?: SourceSaveCapability; gate?: boolean; renderAs?: 'html' | 'markdown'; rawHtml?: string; shareHtml?: string; convertHtml?: boolean; sharingEnabled?: boolean; shareBaseUrl?: string; pasteApiUrl?: string; repoInfo?: { display: string; branch?: string; host?: string }; previousPlan?: string | null; versionInfo?: { version: number; totalVersions: number; project: string }; archivePlans?: ArchivedPlan[]; projectRoot?: string; isWSL?: boolean; serverConfig?: { displayName?: string; gitUser?: string }; recentMessages?: PickerMessage[] }) => {
         // Initialize config store with server-provided values (config file > cookie > default)
         configStore.init(data.serverConfig);
         // Session-level force-markdown preference (--markdown); threaded into folder/linked
@@ -1118,7 +1676,15 @@ const App: React.FC = () => {
           // Folder annotation mode: clear demo content, let user pick a file
           setMarkdown('');
         } else if (data.plan) {
-          setMarkdown(data.plan);
+          // CM6 joins lines with \n; CRLF input would make an untouched
+          // edit round-trip fabricate a whole-document diff. Normalize once.
+          const normalizedPlan = data.plan.replace(/\r\n?/g, '\n');
+          setMarkdown(normalizedPlan);
+          originalMarkdownRef.current = normalizedPlan;
+          if (data.mode === 'annotate' && data.sourceSave?.enabled) {
+            const key = editableDocumentKey(data.sourceSave, `file:${data.sourceSave.path}`);
+            editableDocuments.openDocument({ key, text: normalizedPlan, sourceSave: data.sourceSave });
+          }
         }
         setIsApiMode(true);
         if (data.mode === 'annotate' || data.mode === 'annotate-last' || data.mode === 'annotate-folder') {
@@ -1189,6 +1755,8 @@ const App: React.FC = () => {
         // Not in API mode - use default content
         setIsApiMode(false);
         setAISessionEnabled(false);
+        // Demo mode still exercises edit mode; baseline is the demo plan.
+        originalMarkdownRef.current = DEMO_PLAN_CONTENT;
       })
       .finally(() => setIsLoading(false));
   }, [isLoadingShared, isSharedSession]);
@@ -1246,7 +1814,10 @@ const App: React.FC = () => {
     autoSaveAttempted.current = false;
     autoSaveResultsRef.current = {};
     autoSavePromiseRef.current = null;
-  }, [markdown]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once on mount;
+    // markdown changes from edit commits, linked docs, or discard must NOT reset
+    // the arrival auto-save (Bear creates a new note each time).
+  }, []);
 
   useEffect(() => {
     if (!isApiMode || !markdown || isSharedSession || annotateMode || archive.archiveMode) return;
@@ -1384,6 +1955,11 @@ const App: React.FC = () => {
   const handleApprove = async () => {
     setIsSubmitting(true);
     try {
+      // Integrations must describe the same document the feedback diff does —
+      // mid-edit submits read the live editor buffer, not stale markdown state.
+      const currentMarkdown = isEditingMarkdown
+        ? markdownEditorHandleRef.current?.getMarkdown() ?? displayedMarkdown
+        : displayedMarkdown;
       const obsidianSettings = getObsidianSettings();
       const bearSettings = getBearSettings();
       const octarineSettings = getOctarineSettings();
@@ -1416,7 +1992,7 @@ const App: React.FC = () => {
         body.obsidian = {
           vaultPath: effectiveVaultPath,
           folder: obsidianSettings.folder || 'plannotator',
-          plan: markdown,
+          plan: currentMarkdown,
           ...(obsidianSettings.filenameFormat && { filenameFormat: obsidianSettings.filenameFormat }),
           ...(obsidianSettings.filenameSeparator && obsidianSettings.filenameSeparator !== 'space' && { filenameSeparator: obsidianSettings.filenameSeparator }),
         };
@@ -1426,7 +2002,7 @@ const App: React.FC = () => {
       // if the arrival auto-save already succeeded.
       if (bearSettings.enabled && !(bearSettings.autoSave && autoSaveResults.bear)) {
         body.bear = {
-          plan: markdown,
+          plan: currentMarkdown,
           customTags: bearSettings.customTags,
           tagPosition: bearSettings.tagPosition,
         };
@@ -1434,18 +2010,22 @@ const App: React.FC = () => {
 
       if (isOctarineConfigured()) {
         body.octarine = {
-          plan: markdown,
+          plan: currentMarkdown,
           workspace: octarineSettings.workspace,
           folder: octarineSettings.folder || 'plannotator',
         };
       }
 
-      // Include annotations as feedback if any exist (for OpenCode "approve with notes")
+      // Include annotations as feedback if any exist (for OpenCode "approve with notes").
+      // Direct edits count as feedback too — without the editsSection check here,
+      // an edit-only approval would silently drop the user's changes.
       const hasDocAnnotations = Array.from(linkedDocHook.getDocAnnotations().values()).some(
         (d) => d.annotations.length > 0 || d.globalAttachments.length > 0
       );
-      if (allAnnotations.length > 0 || codeAnnotations.length > 0 || globalAttachments.length > 0 || hasDocAnnotations || editorAnnotations.length > 0) {
-        body.feedback = messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput;
+      const editsSection = buildEditsSection();
+      const savedChangesSection = buildSavedChangesSection();
+      if (allAnnotations.length > 0 || codeAnnotations.length > 0 || globalAttachments.length > 0 || hasDocAnnotations || editorAnnotations.length > 0 || editsSection || savedChangesSection) {
+        body.feedback = composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput);
       }
 
       await fetch('/api/approve', {
@@ -1467,7 +2047,7 @@ const App: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          feedback: messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput,
+          feedback: composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput),
           planSave: {
             enabled: planSaveSettings.enabled,
             ...(planSaveSettings.customPath && { customPath: planSaveSettings.customPath }),
@@ -1484,7 +2064,8 @@ const App: React.FC = () => {
   const handleAnnotateFeedback = async () => {
     setIsSubmitting(true);
     try {
-      const feedback = messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput;
+      snapshotActiveEditableDocument();
+      const feedback = composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput);
       const scopedSelectedMessageId = messageMultiSelectMode
         ? annotatedMessageIds.length === 1 ? annotatedMessageIds[0] : undefined
         : selectedMessageId ?? undefined;
@@ -1572,8 +2153,13 @@ const App: React.FC = () => {
       // Don't intercept in demo/share mode (no API)
       if (!isApiMode) return;
 
-      // Don't submit while viewing a linked doc
-      if (linkedDocHook.isActive) return;
+      // While the markdown editor is open, submit shortcuts belong to editing,
+      // not the review session.
+      if (isEditingMarkdown) return;
+
+      // Folder files are the active review target; normal linked docs are side
+      // references and should not submit the root plan.
+      if (linkedDocHook.isActive && annotateSource !== 'folder') return;
 
       if (goalSetupMode) {
         if (document.querySelector('[data-comment-popover="true"]')) return;
@@ -1591,7 +2177,7 @@ const App: React.FC = () => {
       // Annotate mode: gate-enabled + no annotations → approve (empty stdout).
       // Otherwise: send feedback.
       if (annotateMode) {
-        if (gate && !hasAnyAnnotations) {
+        if (gate && !hasFeedbackToSend) {
           handleAnnotateApprove();
           return;
         }
@@ -1599,12 +2185,8 @@ const App: React.FC = () => {
         return;
       }
 
-      // No annotations → Approve, otherwise → Send Feedback
-      const docAnnotations = linkedDocHook.getDocAnnotations();
-      const hasDocAnnotations = Array.from(docAnnotations.values()).some(
-        (d) => d.annotations.length > 0 || d.globalAttachments.length > 0
-      );
-      if (allAnnotations.length === 0 && codeAnnotations.length === 0 && editorAnnotations.length === 0 && !hasDocAnnotations) {
+      // No feedback → Approve, otherwise → Send Feedback
+      if (!hasFeedbackToSend) {
         // Check if agent exists for OpenCode users
         if (origin === 'opencode') {
           const warning = getAgentWarning();
@@ -1616,6 +2198,8 @@ const App: React.FC = () => {
         }
         handleApprove();
       } else {
+        // Direct edits route through deny too: on Claude Code, deny is the only
+        // channel whose output carries feedback to the agent.
         handleDeny();
       }
     };
@@ -1625,9 +2209,9 @@ const App: React.FC = () => {
   }, [
     showExport, showImport, showFeedbackPrompt, showClaudeCodeWarning, showExitWarning, showAgentWarning,
     showPermissionModeSetup, pendingPasteImage,
-    submitted, isSubmitting, isExiting, goalSetupAction.isSubmitting, isApiMode, linkedDocHook.isActive, annotations.length, codeAnnotations.length, externalAnnotations.length, annotateMode,
-    gate, hasAnyAnnotations, goalSetupMode, goalSetupAction.canSubmit,
-    origin, getAgentWarning,
+    submitted, isSubmitting, isExiting, goalSetupAction.isSubmitting, isApiMode, isEditingMarkdown, linkedDocHook.isActive, annotations.length, codeAnnotations.length, externalAnnotations.length, annotateMode,
+    gate, hasFeedbackToSend, goalSetupMode, goalSetupAction.canSubmit,
+    annotateSource, origin, getAgentWarning,
   ]);
 
   const handleAddAnnotation = (ann: Annotation) => {
@@ -1842,7 +2426,7 @@ const App: React.FC = () => {
       return {
         mode: 'annotate',
         annotate: {
-          content: aiRenderAs === 'html' && rawHtml ? rawHtml : markdown,
+          content: aiRenderAs === 'html' && rawHtml ? rawHtml : displayedMarkdown,
           filePath: aiDocumentPath,
           sourceInfo: aiSourceInfo,
           sourceConverted: aiSourceConverted,
@@ -1873,6 +2457,7 @@ const App: React.FC = () => {
     aiDocumentMode,
     hasAIDocumentContext,
     archive.archiveMode,
+    displayedMarkdown,
     goalSetupMode,
     markdown,
     previousPlan,
@@ -2001,7 +2586,7 @@ const App: React.FC = () => {
 
   // Quick-save handlers for export dropdown and keyboard shortcut
   const handleDownloadAnnotations = () => {
-    const output = messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput;
+    const output = composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput);
     const blob = new Blob([output], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -2014,6 +2599,10 @@ const App: React.FC = () => {
 
   const handleQuickSaveToNotes = async (target: 'obsidian' | 'bear' | 'octarine') => {
     const body: { obsidian?: object; bear?: object; octarine?: object } = {};
+    // Mid-edit saves describe the live buffer, matching handleApprove.
+    const quickSaveMarkdown = isEditingMarkdown
+      ? markdownEditorHandleRef.current?.getMarkdown() ?? displayedMarkdown
+      : displayedMarkdown;
 
     if (target === 'obsidian') {
       const s = getObsidianSettings();
@@ -2022,7 +2611,7 @@ const App: React.FC = () => {
         body.obsidian = {
           vaultPath,
           folder: s.folder || 'plannotator',
-          plan: markdown,
+          plan: quickSaveMarkdown,
           ...(s.filenameFormat && { filenameFormat: s.filenameFormat }),
           ...(s.filenameSeparator && s.filenameSeparator !== 'space' && { filenameSeparator: s.filenameSeparator }),
         };
@@ -2031,7 +2620,7 @@ const App: React.FC = () => {
     if (target === 'bear') {
       const bs = getBearSettings();
       body.bear = {
-        plan: markdown,
+        plan: quickSaveMarkdown,
         customTags: bs.customTags,
         tagPosition: bs.tagPosition,
       };
@@ -2039,7 +2628,7 @@ const App: React.FC = () => {
     if (target === 'octarine') {
       const os = getOctarineSettings();
       body.octarine = {
-        plan: markdown,
+        plan: quickSaveMarkdown,
         workspace: os.workspace,
         folder: os.folder || 'plannotator',
       };
@@ -2063,6 +2652,91 @@ const App: React.FC = () => {
       toast.error('Save failed');
     }
   };
+
+  const handleSaveEditedSourceFile = useCallback(async (): Promise<boolean> => {
+    if (!isEditingMarkdown) return false;
+
+    const activeDocument = editableDocuments.getActiveDocumentLive();
+    const activeSourceSave = activeDocument?.sourceSave;
+    if (!activeDocument || !activeSourceSave?.enabled) {
+      toast.error('This document cannot be saved to a file');
+      return true;
+    }
+
+    const edited = markdownEditorHandleRef.current?.getMarkdown();
+    if (edited == null) {
+      toast.error('Editor is not ready');
+      return true;
+    }
+
+    editableDocuments.updateActiveText(edited);
+    editableDocuments.markSaving(activeDocument.key);
+    try {
+      const res = await fetch('/api/source/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: activeSourceSave.scope === 'folder-file' ? activeSourceSave.path : undefined,
+          text: edited,
+          baseHash: activeSourceSave.hash,
+          baseMtimeMs: activeSourceSave.mtimeMs,
+        }),
+      });
+      const data = (await res.json()) as SourceSaveResponse;
+
+      if (!res.ok || !data.ok) {
+        const message = !data.ok ? data.message : 'Save failed';
+        if (!data.ok && data.code === 'conflict') {
+          editableDocuments.markConflict(activeDocument.key, message);
+          toast.error('File changed on disk', {
+            description: 'Reload or copy your edits before saving again.',
+          });
+        } else {
+          editableDocuments.markError(activeDocument.key, message);
+          toast.error(message);
+        }
+        return true;
+      }
+
+      const nextSourceSave = {
+        ...activeSourceSave,
+        hash: data.hash,
+        mtimeMs: data.mtimeMs,
+        size: data.size,
+        eol: data.eol,
+      };
+      editableDocuments.markSaved({
+        key: activeDocument.key,
+        text: edited,
+        sourceSave: nextSourceSave,
+      });
+      const normalizedEdited = edited.replace(/\r\n?/g, '\n');
+      editedMarkdownRef.current = null;
+      if (editableDocuments.getActiveKey() === activeDocument.key) {
+        const live = markdownEditorHandleRef.current?.getMarkdown();
+        const normalizedLive = live?.replace(/\r\n?/g, '\n');
+        editSessionBaseRef.current = normalizedEdited;
+        const currentText = normalizedLive ?? editableDocuments.getDocument(activeDocument.key)?.currentText ?? normalizedEdited;
+        if (currentText === normalizedEdited) {
+          setEditorDirty(false);
+          setEditorDiffersFromBaseline(false);
+          setEditStats(null);
+        } else {
+          editableDocuments.updateActiveText(currentText, { forceNotify: true });
+          setEditorDirty(true);
+          setEditorDiffersFromBaseline(true);
+          setEditStats(computeEditStats(normalizedEdited, currentText));
+        }
+      }
+      scheduleDraftSave();
+      toast.success(`Saved ${activeSourceSave.basename}`);
+      return true;
+    } catch {
+      editableDocuments.markError(activeDocument.key, 'Save failed');
+      toast.error('Save failed');
+      return true;
+    }
+  }, [editableDocuments, isEditingMarkdown, scheduleDraftSave]);
 
   // Agent Instructions — copy a clipboard payload teaching external agents
   // (Claude Code, Codex, etc.) how to POST annotations into this session via
@@ -2094,7 +2768,8 @@ const App: React.FC = () => {
     }
   };
 
-  // Cmd/Ctrl+S keyboard shortcut — save to default notes app
+  // Cmd/Ctrl+S keyboard shortcut — while editing, save the active source file;
+  // otherwise keep the existing default notes/export behavior.
   useEffect(() => {
     const handleSaveShortcut = (e: KeyboardEvent) => {
       if (e.key !== 's' || !(e.metaKey || e.ctrlKey)) return;
@@ -2106,6 +2781,12 @@ const App: React.FC = () => {
           showExitWarning || showAgentWarning || showPermissionModeSetup || pendingPasteImage) return;
 
       if (submitted || !isApiMode) return;
+
+      if (isEditingMarkdown && editableDocuments.getActiveDocumentLive()?.sourceSave?.enabled) {
+        e.preventDefault();
+        void handleSaveEditedSourceFile();
+        return;
+      }
 
       e.preventDefault();
 
@@ -2133,7 +2814,7 @@ const App: React.FC = () => {
   }, [
     showExport, showFeedbackPrompt, showClaudeCodeWarning, showExitWarning, showAgentWarning,
     showPermissionModeSetup, pendingPasteImage,
-    submitted, isApiMode, markdown, annotationsOutput,
+    submitted, isApiMode, isEditingMarkdown, handleSaveEditedSourceFile, displayedMarkdown, annotationsOutput,
   ]);
 
   // Cmd/Ctrl+P keyboard shortcut — print plan
@@ -2193,31 +2874,29 @@ const App: React.FC = () => {
   };
 
   const handleHeaderAnnotateExit = useCallback(() => {
-    if (hasAnyAnnotations) {
+    if (hasFeedbackToSend) {
       setExitWarningAction('close');
       setShowExitWarning(true);
     } else {
       headerHandlersRef.current.handleAnnotateExit();
     }
-  }, [hasAnyAnnotations]);
+  }, [hasFeedbackToSend]);
 
   const handleHeaderFeedback = useCallback(() => {
     const h = headerHandlersRef.current;
-    const docAnnotations = h.getDocAnnotations();
-    const hasDocAnnotations = Array.from(docAnnotations.values()).some(
-      (d) => d.annotations.length > 0 || d.globalAttachments.length > 0
-    );
-    if (allAnnotations.length === 0 && codeAnnotations.length === 0 && editorAnnotations.length === 0 && !hasDocAnnotations) {
+    // Direct edits count as feedback — deny is the only Claude Code channel
+    // whose output carries feedback to the agent.
+    if (!hasFeedbackToSend) {
       setShowFeedbackPrompt(true);
     } else {
       h.handleDeny();
     }
-  }, [allAnnotations.length, codeAnnotations.length, editorAnnotations.length]);
+  }, [hasFeedbackToSend]);
 
   const handleHeaderApprove = useCallback(() => {
     const h = headerHandlersRef.current;
     if (annotateMode) {
-      if (hasAnyAnnotations) {
+      if (hasFeedbackToSend) {
         setExitWarningAction('approve');
         setShowExitWarning(true);
         return;
@@ -2225,7 +2904,7 @@ const App: React.FC = () => {
       h.handleAnnotateApprove();
       return;
     }
-    if (origin === 'claude-code' && (allAnnotations.length > 0 || codeAnnotations.length > 0)) {
+    if (origin === 'claude-code' && hasFeedbackToSend) {
       setShowClaudeCodeWarning(true);
       return;
     }
@@ -2238,7 +2917,7 @@ const App: React.FC = () => {
       }
     }
     h.handleApprove();
-  }, [annotateMode, hasAnyAnnotations, origin, allAnnotations.length, codeAnnotations.length]);
+  }, [annotateMode, hasFeedbackToSend, origin]);
 
   const handleHeaderAnnotateFeedback = useCallback(() => headerHandlersRef.current.handleAnnotateFeedback(), []);
   const handleHeaderAnnotateApprove = useCallback(() => headerHandlersRef.current.handleAnnotateApprove(), []);
@@ -2313,13 +2992,13 @@ const App: React.FC = () => {
           aiAvailable={canUseAI}
           isAIChatOpen={isPanelOpen && rightSidebarTab === 'ai'}
           aiHasMessages={aiMessages.length > 0}
-          hasAnyAnnotations={hasAnyAnnotations}
+          hasAnyAnnotations={hasAnyAnnotations || hasDirectEdits}
           linkedDocIsActive={linkedDocHook.isActive}
           callbackShareUrlReady={callbackConfig ? Boolean(shareUrl || shortShareUrl || (renderAs === 'html' && (shareHtml || rawHtml))) : true}
           canShareCurrentSession={canShareCurrentSession}
           agentName={agentName}
           availableAgents={availableAgents}
-          showAnnotationsWarning={allAnnotations.length > 0 || codeAnnotations.length > 0}
+          showAnnotationsWarning={hasFeedbackToSend}
           callbackConfig={callbackConfig}
           taterMode={taterMode}
           mobileSettingsOpen={mobileSettingsOpen}
@@ -2414,8 +3093,21 @@ const App: React.FC = () => {
                 showFilesTab={showFilesTab && !archive.archiveMode}
                 fileAnnotationCounts={fileAnnotationCounts}
                 highlightedFiles={highlightedFiles}
+                fileEditStatuses={editableDocuments.fileEditStatuses}
                 fileBrowser={fileBrowser}
-                onFilesSelectFile={handleFileBrowserSelect}
+                onFilesSelectFile={(...args: Parameters<typeof handleFileBrowserSelect>) => {
+                  // Plan/review linked-doc browsing still swaps the root document
+                  // under the editor. Folder mode snapshots the active file first.
+                  if (isEditingMarkdown && annotateSource !== 'folder') {
+                    toast('Finish editing first', { description: 'Use "Done editing" before opening files.' });
+                    return;
+                  }
+                  if (isEditingMarkdown && !/\.(mdx?|txt)$/i.test(args[0])) {
+                    toast('Finish editing first', { description: 'Use "Done editing" before opening non-editable files.' });
+                    return;
+                  }
+                  handleFileBrowserSelect(...args);
+                }}
                 onFilesFetchAll={() => fileBrowser.fetchAll(fileBrowserDirs)}
                 onFilesRetryVaultDir={(vaultPath) => fileBrowser.addVaultDir(vaultPath)}
                 hasFileAnnotations={hasFileAnnotations}
@@ -2423,10 +3115,10 @@ const App: React.FC = () => {
                 versionInfo={versionInfo}
                 versions={planDiff.versions}
                 selectedBaseVersion={planDiff.diffBaseVersion}
-                onSelectBaseVersion={planDiff.selectBaseVersion}
+                onSelectBaseVersion={handleSelectBaseVersion}
                 isPlanDiffActive={isPlanDiffActive}
                 hasPreviousVersion={planDiff.hasPreviousVersion}
-                onActivatePlanDiff={() => setIsPlanDiffActive(true)}
+                onActivatePlanDiff={handleActivatePlanDiff}
                 isLoadingVersions={planDiff.isLoadingVersions}
                 isSelectingVersion={planDiff.isSelectingVersion}
                 fetchingVersion={planDiff.fetchingVersion}
@@ -2434,7 +3126,15 @@ const App: React.FC = () => {
                 showArchiveTab={isApiMode && !annotateMode && !goalSetupMode}
                 archivePlans={archive.plans}
                 selectedArchiveFile={archive.selectedFile}
-                onArchiveSelect={archive.select}
+                onArchiveSelect={(...args: Parameters<typeof archive.select>) => {
+                  // Archive selection swaps the markdown state under the open
+                  // editor — block it rather than corrupt the edit session.
+                  if (isEditingMarkdown) {
+                    toast('Finish editing first', { description: 'Use "Done editing" before browsing archived plans.' });
+                    return;
+                  }
+                  archive.select(...args);
+                }}
                 isLoadingArchive={archive.isLoading}
                 showMessagesTab={annotateSource === 'message' && recentMessages.length > 1}
                 messages={recentMessages}
@@ -2458,7 +3158,7 @@ const App: React.FC = () => {
               onClose={dismissDraft}
               onConfirm={handleRestoreDraft}
               title="Draft Recovered"
-              message={draftBanner ? `Found ${draftBanner.count} annotation${draftBanner.count !== 1 ? 's' : ''} from ${draftBanner.timeAgo}. Would you like to restore them?` : ''}
+              message={draftBanner ? draftBannerMessage(draftBanner) : ''}
               confirmText="Restore"
               cancelText="Dismiss"
               showCancel
@@ -2471,7 +3171,7 @@ const App: React.FC = () => {
                   sticky actions are disabled. remountToken re-anchors the
                   ResizeObserver when Viewer swaps content (linked docs or
                   message switches). */}
-              {!goalSetupMode && !isPlanDiffActive && !isHtmlSurface && !archive.archiveMode && uiPrefs.stickyActionsEnabled && (
+              {!goalSetupMode && !isPlanDiffActive && !isHtmlSurface && !archive.archiveMode && !isEditingMarkdown && uiPrefs.stickyActionsEnabled && (
                 <StickyHeaderLane
                   inputMethod={inputMethod}
                   onInputMethodChange={handleInputMethodChange}
@@ -2493,7 +3193,7 @@ const App: React.FC = () => {
                   comment/markup mode). Hidden during plan diff, and on HTML surfaces
                   when the header's "Hide tools" toggle is on (leaving the rendered HTML
                   free of overlay controls). On HTML it floats top-left over the doc. */}
-              {!goalSetupMode && !isPlanDiffActive && !archive.archiveMode && !(isHtmlSurface && htmlToolsHidden) && (
+              {!goalSetupMode && !isPlanDiffActive && !archive.archiveMode && !isEditingMarkdown && !(isHtmlSurface && htmlToolsHidden) && (
                 <div
                   data-print-hide
                   className={isHtmlSurface
@@ -2555,15 +3255,15 @@ const App: React.FC = () => {
                 </div>
               )}
               {/* Normal Plan View — always mounted, hidden during diff mode */}
-              <div className={`w-full relative ${isHtmlSurface ? 'flex-1 flex flex-col' : 'flex justify-center'}`} style={{ display: goalSetupMode || (isPlanDiffActive && planDiff.diffBlocks) || (annotateSource === 'folder' && !markdown && !linkedDocHook.isActive) ? 'none' : undefined }}>
-                {canUseWideMode && !isPlanDiffActive && !archive.archiveMode && !isHtmlSurface && (
+              <div className={`w-full relative ${isHtmlSurface ? 'flex-1 flex flex-col' : `flex justify-center${isEditingMarkdown ? ' flex-1 min-h-0' : ''}`}`} style={{ display: goalSetupMode || (isPlanDiffActive && planDiff.diffBlocks) || (annotateSource === 'folder' && !markdown && !linkedDocHook.isActive) ? 'none' : undefined }}>
+                {(canUseWideMode || canEditMarkdown) && !isPlanDiffActive && !archive.archiveMode && !isHtmlSurface && (
                   <div
                     data-print-hide
                     className="absolute -top-5 left-0 right-0 mx-auto w-full flex justify-end pointer-events-none"
                     style={annotateReaderMaxWidth === null ? undefined : { maxWidth: annotateReaderMaxWidth ?? 832 }}
                   >
                     <div className={`pointer-events-auto flex items-center gap-1.5 text-[11px] tracking-wide ${taterMode ? 'mr-[60px]' : 'mr-[4px]'}`}>
-                      {(['wide', 'focus'] as const).map((type, i) => (
+                      {canUseWideMode && (['wide', 'focus'] as const).map((type, i) => (
                         <React.Fragment key={type}>
                           {i > 0 && <span aria-hidden className="text-muted-foreground/30 select-none">|</span>}
                           <Tooltip
@@ -2586,6 +3286,52 @@ const App: React.FC = () => {
                           </Tooltip>
                         </React.Fragment>
                       ))}
+                      {canEditMarkdown && (
+                        <>
+                          {canUseWideMode && <span aria-hidden className="text-muted-foreground/30 select-none">|</span>}
+                          {isEditingMarkdown && activeSourceSave && (
+                            <>
+                              <Tooltip
+                                side="top"
+                                align="end"
+                                content={`Save changes to ${activeSourceSave.basename}`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => { void handleSaveEditedSourceFile(); }}
+                                  disabled={activeEditableDocument?.saveStatus === 'saving'}
+                                  className={`cursor-pointer rounded-sm transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background active:opacity-80 disabled:cursor-not-allowed disabled:opacity-50 ${
+                                    activeEditableDocument?.saveStatus === 'saved'
+                                      ? 'text-primary'
+                                      : 'text-muted-foreground/50 hover:text-muted-foreground'
+                                  }`}
+                                >
+                                  {activeEditableDocument?.saveStatus === 'saving' ? 'Saving' : 'Save'}
+                                </button>
+                              </Tooltip>
+                              <span aria-hidden className="text-muted-foreground/30 select-none">|</span>
+                            </>
+                          )}
+                          <Tooltip
+                            side="top"
+                            align="end"
+                            content={isEditingMarkdown ? 'Commit your edits and return to annotating' : 'Edit the document text directly'}
+                          >
+                            <button
+                              type="button"
+                              onClick={handleEditToggle}
+                              aria-pressed={isEditingMarkdown}
+                              className={`cursor-pointer rounded-sm transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background active:opacity-80 ${
+                                isEditingMarkdown
+                                  ? 'text-primary'
+                                  : 'text-muted-foreground/50 hover:text-muted-foreground'
+                              }`}
+                            >
+                              {isEditingMarkdown ? 'Done' : 'Edit'}
+                            </button>
+                          </Tooltip>
+                        </>
+                      )}
                     </div>
                   </div>
                 )}
@@ -2608,12 +3354,21 @@ const App: React.FC = () => {
                     hideControls={htmlToolsHidden}
                     onAskAI={canUseAI ? handleAskAI : undefined}
                   />
+                ) : isEditingMarkdown ? (
+                  <MarkdownEditor
+                    markdown={displayedMarkdown}
+                    documentId={`edit:${activeEditableDocument?.key ?? 'root'}:${editGeneration}`}
+                    editorHandleRef={markdownEditorHandleRef}
+                    onMarkdownChange={handleEditorChange}
+                    maxWidth={annotateReaderMaxWidth}
+                    gridEnabled={gridEnabled}
+                  />
                 ) : (
                   <Viewer
                     key={viewerContentKey}
                     ref={viewerRef}
                     blocks={blocks}
-                    markdown={markdown}
+                    markdown={displayedMarkdown}
                     frontmatter={frontmatter}
                     annotations={viewerAnnotations}
                     onAddAnnotation={handleAddAnnotation}
@@ -2690,11 +3445,15 @@ const App: React.FC = () => {
             onDeleteEditorAnnotation={deleteEditorAnnotation}
             onClose={() => setIsPanelOpen(false)}
             onQuickCopy={async () => {
-              const output = messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput;
+              const output = composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput);
               await navigator.clipboard.writeText(wrapFeedbackForAgent(output));
             }}
             onShare={canShareCurrentSession ? () => { setIsPanelOpen(false); setInitialExportTab('share'); setShowExport(true); } : undefined}
             otherFileAnnotations={otherFileAnnotations}
+            directEdits={directEditsPanelInfo?.map((item) => ({
+              ...item,
+              onDiscard: () => handleDiscardEdits(item.sourceKey),
+            })) ?? null}
             onOtherFileAnnotationsClick={handleFlashAnnotatedFiles}
           />
           {isPanelOpen && rightSidebarTab === 'ai' && wideModeType === null && !goalSetupMode && canUseAI && (
@@ -2775,7 +3534,13 @@ const App: React.FC = () => {
           isGeneratingShortUrl={isGeneratingShortUrl}
           shortUrlError={shortUrlError}
           onGenerateShortUrl={generateShortUrl}
-          annotationsOutput={showExport && messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput}
+          annotationsOutput={
+            // Computed only while the modal is open: composeFeedback runs a
+            // unified diff when edits exist — not per-render work.
+            showExport
+              ? composeFeedback(messageMultiSelectMode ? buildFullAnnotationsOutput() : annotationsOutput)
+              : ''
+          }
           annotationCount={allAnnotations.length + codeAnnotations.length}
           taterSprite={taterMode ? <TaterSpritePullup /> : undefined}
           sharingEnabled={canShareCurrentSession}
@@ -2796,12 +3561,16 @@ const App: React.FC = () => {
         <ConfirmDialog
           isOpen={showFeedbackPrompt}
           onClose={() => setShowFeedbackPrompt(false)}
-          title="Add Annotations First"
-          message={`To provide feedback, select text in the plan and add annotations. ${agentName} will use your annotations to revise the plan.`}
+          title="Add Feedback First"
+          message={
+            canEditMarkdown
+              ? `To provide feedback, add annotations or direct edits. ${agentName} will use your feedback to revise the ${annotateMode ? 'document' : 'plan'}.`
+              : `To provide feedback, select text and add annotations. ${agentName} will use your annotations to revise the ${annotateMode ? 'document' : 'plan'}.`
+          }
           variant="info"
         />
 
-        {/* Claude Code annotation warning dialog */}
+        {/* Claude Code feedback warning dialog */}
         <ConfirmDialog
           isOpen={showClaudeCodeWarning}
           onClose={() => setShowClaudeCodeWarning(false)}
@@ -2809,8 +3578,12 @@ const App: React.FC = () => {
             setShowClaudeCodeWarning(false);
             handleApprove();
           }}
-          title="Annotations Won't Be Sent"
-          message={<>{agentName} doesn't yet support feedback on approval. Your {allAnnotations.length + codeAnnotations.length} annotation{(allAnnotations.length + codeAnnotations.length) !== 1 ? 's' : ''} will be lost.</>}
+          title="Feedback Won't Be Sent"
+          message={
+            hasOnlySavedFileChanges
+              ? <>{agentName} doesn't yet support feedback on approval. {savedFileAwarenessOnlyMessage}</>
+              : <>{agentName} doesn't yet support feedback on approval. Your {feedbackLoss} will be lost.{savedFileAwarenessMixedMessage}</>
+          }
           subMessage={
             <>
               To send feedback, use <strong>Send Feedback</strong> instead.
@@ -2828,7 +3601,7 @@ const App: React.FC = () => {
           showCancel
         />
 
-        {/* Unsaved-annotations warning dialog — reused by Close and (in gate mode) Approve */}
+        {/* Unsent feedback warning dialog — reused by Close and (in gate mode) Approve */}
         <ConfirmDialog
           isOpen={showExitWarning}
           onClose={() => setShowExitWarning(false)}
@@ -2837,9 +3610,13 @@ const App: React.FC = () => {
             if (exitWarningAction === 'approve') handleAnnotateApprove();
             else handleAnnotateExit();
           }}
-          title="Annotations Won't Be Sent"
-          message={<>You have {feedbackAnnotationCount} annotation{feedbackAnnotationCount !== 1 ? 's' : ''} that will be lost if you {exitWarningAction === 'approve' ? 'approve' : 'close'}.</>}
-          subMessage="To send your annotations, use Send Annotations instead."
+          title="Feedback Won't Be Sent"
+          message={
+            hasOnlySavedFileChanges
+              ? <>{savedFileChangesOnDiskMessage} The agent will not get that context if you {exitWarningAction === 'approve' ? 'approve' : 'close'}.</>
+              : <>You have {feedbackLoss} that will be lost if you {exitWarningAction === 'approve' ? 'approve' : 'close'}.{savedFileAwarenessMixedMessage}</>
+          }
+          subMessage={hasOnlySavedFileChanges ? 'To tell the agent what changed, use Send Feedback instead.' : 'To send this feedback, use Send Feedback instead.'}
           confirmText={exitWarningAction === 'approve' ? 'Approve Anyway' : 'Close Anyway'}
           cancelText="Cancel"
           variant="warning"
@@ -2904,7 +3681,7 @@ const App: React.FC = () => {
             : goalSetupMode ? 'Answers Submitted'
             : submitted === 'approved'
               ? (annotateMode ? 'Approved' : 'Plan Approved')
-              : annotateMode ? 'Annotations Sent'
+              : annotateMode ? 'Feedback Sent'
             : 'Feedback Sent'
           }
           subtitle={
@@ -2919,8 +3696,8 @@ const App: React.FC = () => {
                       ? `${agentName} will proceed.`
                       : `${agentName} will proceed with the implementation.`)
                   : annotateMode
-                    ? `${agentName} will address your annotations on the ${annotateSource === 'message' ? 'message' : annotateSource === 'folder' ? 'files' : 'file'}.`
-                    : `${agentName} will revise the plan based on your annotations.`
+                    ? `${agentName} will address your feedback on the ${annotateSource === 'message' ? 'message' : annotateSource === 'folder' ? 'files' : 'file'}.`
+                    : `${agentName} will revise the plan based on your feedback.`
           }
           agentLabel={agentName}
         />

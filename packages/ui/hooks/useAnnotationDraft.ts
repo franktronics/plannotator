@@ -5,21 +5,43 @@
  * including `source`, `id`, offsets, and meta). On mount, checks for
  * an existing draft and exposes banner state for the UI to offer restoration.
  *
+ * Direct edits persist alongside annotations: the host supplies a
+ * `getEditedMarkdown` getter (the live editor buffer or last committed edit,
+ * null when none) and calls `scheduleDraftSave()` on edit activity. The
+ * getter is read at save time, not reactively, so per-keystroke saves don't
+ * require pushing the full document through React state.
+ *
  * Backward compatible: loads old tuple-serialized drafts via fromShareable().
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import type { SourceSaveCapability } from '@plannotator/shared/source-save';
 import type { Annotation, CodeAnnotation, ImageAttachment } from '../types';
 import { fromShareable, parseShareableImages } from '../utils/sharing';
 import type { ShareableAnnotation } from '../utils/sharing';
 
 const DEBOUNCE_MS = 500;
 
+type DraftSourceSaveCapability = Extract<SourceSaveCapability, { enabled: true }>;
+
+export interface DraftEditedDocument {
+  key: string;
+  sourceSave: DraftSourceSaveCapability;
+  sessionOpenText: string;
+  diskBaseline: string;
+  currentText: string;
+}
+
 /** New format: full objects. */
 interface DraftData {
   annotations: Annotation[];
   codeAnnotations?: CodeAnnotation[];
   globalAttachments: ImageAttachment[];
+  /** Direct-edit document text. Present only when it differs from the
+      as-submitted baseline ('' is a real value: a committed emptied doc). */
+  editedMarkdown?: string;
+  /** Source-backed direct edits for folder/single-file annotate sessions. */
+  editedDocuments?: DraftEditedDocument[];
   ts: number;
 }
 
@@ -33,6 +55,26 @@ interface LegacyDraftData {
 
 function isLegacyDraft(data: unknown): data is LegacyDraftData {
   return !!data && typeof data === 'object' && 'a' in data && Array.isArray((data as LegacyDraftData).a);
+}
+
+function isDraftEditedDocument(value: unknown): value is DraftEditedDocument {
+  if (!value || typeof value !== 'object') return false;
+  const doc = value as Partial<DraftEditedDocument>;
+  const sourceSave = doc.sourceSave as Partial<DraftSourceSaveCapability> | undefined;
+  return (
+    typeof doc.key === 'string' &&
+    typeof doc.sessionOpenText === 'string' &&
+    typeof doc.diskBaseline === 'string' &&
+    typeof doc.currentText === 'string' &&
+    !!sourceSave &&
+    sourceSave.enabled === true &&
+    typeof sourceSave.path === 'string' &&
+    typeof sourceSave.basename === 'string' &&
+    typeof sourceSave.hash === 'string' &&
+    typeof sourceSave.mtimeMs === 'number' &&
+    typeof sourceSave.size === 'number' &&
+    typeof sourceSave.eol === 'string'
+  );
 }
 
 function formatTimeAgo(ts: number): string {
@@ -50,14 +92,30 @@ interface UseAnnotationDraftOptions {
   annotations: Annotation[];
   codeAnnotations?: CodeAnnotation[];
   globalAttachments: ImageAttachment[];
+  /** Current direct-edit text (live buffer or last commit), or null when the
+      document matches the as-submitted baseline. Read at save time. */
+  getEditedMarkdown?: () => string | null;
+  /** Current dirty source-backed documents. Read at save time. */
+  getEditedDocuments?: () => DraftEditedDocument[];
   isApiMode: boolean;
   isSharedSession: boolean;
   submitted: boolean;
 }
 
+interface RestoredDraft {
+  annotations: Annotation[];
+  codeAnnotations: CodeAnnotation[];
+  globalAttachments: ImageAttachment[];
+  editedMarkdown: string | null;
+  editedDocuments: DraftEditedDocument[];
+}
+
 interface UseAnnotationDraftResult {
-  draftBanner: { count: number; timeAgo: string } | null;
-  restoreDraft: () => { annotations: Annotation[]; codeAnnotations: CodeAnnotation[]; globalAttachments: ImageAttachment[] };
+  draftBanner: { count: number; timeAgo: string; hasEdits: boolean } | null;
+  restoreDraft: () => RestoredDraft;
+  /** Debounced save trigger for changes the reactive deps can't see
+      (editor keystrokes, edit commit/discard). Stable identity. */
+  scheduleDraftSave: () => void;
   dismissDraft: () => void;
 }
 
@@ -65,14 +123,24 @@ export function useAnnotationDraft({
   annotations,
   codeAnnotations = [],
   globalAttachments,
+  getEditedMarkdown,
+  getEditedDocuments,
   isApiMode,
   isSharedSession,
   submitted,
 }: UseAnnotationDraftOptions): UseAnnotationDraftResult {
-  const [draftBanner, setDraftBanner] = useState<{ count: number; timeAgo: string } | null>(null);
-  const draftDataRef = useRef<{ annotations: Annotation[]; codeAnnotations: CodeAnnotation[]; globalAttachments: ImageAttachment[] } | null>(null);
+  const [draftBanner, setDraftBanner] = useState<{ count: number; timeAgo: string; hasEdits: boolean } | null>(null);
+  const draftDataRef = useRef<RestoredDraft | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasMountedRef = useRef(false);
+
+  // Latest-values ref so the stable scheduleDraftSave reads current data when
+  // the debounce fires, without re-creating callbacks per keystroke.
+  const latestRef = useRef({ annotations, codeAnnotations, globalAttachments, getEditedMarkdown, getEditedDocuments });
+  latestRef.current = { annotations, codeAnnotations, globalAttachments, getEditedMarkdown, getEditedDocuments };
+  const canPersist = isApiMode && !isSharedSession && !submitted;
+  const canPersistRef = useRef(canPersist);
+  canPersistRef.current = canPersist;
 
   // Load draft on mount
   useEffect(() => {
@@ -111,12 +179,28 @@ export function useAnnotationDraft({
           return;
         }
 
+        const restoredEdited =
+          !isLegacyDraft(data) && typeof (data as DraftData).editedMarkdown === 'string'
+            ? (data as DraftData).editedMarkdown!
+            : null;
+        const restoredEditedDocuments =
+          !isLegacyDraft(data) && Array.isArray((data as DraftData).editedDocuments)
+            ? (data as DraftData).editedDocuments!.filter(isDraftEditedDocument)
+            : [];
+
         const totalCount = restoredAnnotations.length + restoredCodeAnnotations.length + restoredGlobal.length;
-        if (totalCount > 0) {
-          draftDataRef.current = { annotations: restoredAnnotations, codeAnnotations: restoredCodeAnnotations, globalAttachments: restoredGlobal };
+        if (totalCount > 0 || restoredEdited !== null || restoredEditedDocuments.length > 0) {
+          draftDataRef.current = {
+            annotations: restoredAnnotations,
+            codeAnnotations: restoredCodeAnnotations,
+            globalAttachments: restoredGlobal,
+            editedMarkdown: restoredEdited,
+            editedDocuments: restoredEditedDocuments,
+          };
           setDraftBanner({
             count: totalCount,
             timeAgo: formatTimeAgo(data.ts || 0),
+            hasEdits: restoredEdited !== null || restoredEditedDocuments.length > 0,
           });
         }
         hasMountedRef.current = true;
@@ -126,42 +210,94 @@ export function useAnnotationDraft({
       });
   }, [isApiMode, isSharedSession]);
 
+  const persistNow = useCallback((keepalive: boolean) => {
+    // Re-check: the session may have been submitted while the debounce was
+    // pending — a save landing after submit would resurrect a draft the
+    // server just deleted, ghosting it into the next session for this plan.
+    if (!canPersistRef.current) return;
+    const { annotations, codeAnnotations, globalAttachments, getEditedMarkdown, getEditedDocuments } = latestRef.current;
+    const editedMarkdown = getEditedMarkdown?.() ?? null;
+    const editedDocuments = getEditedDocuments?.() ?? [];
+
+    if (annotations.length === 0 && codeAnnotations.length === 0 && globalAttachments.length === 0 && editedMarkdown === null && editedDocuments.length === 0) {
+      // Everything was cleared (last annotation removed, edits discarded).
+      // A stale draft left on disk would offer back content the user
+      // explicitly threw away.
+      fetch('/api/draft', { method: 'DELETE', keepalive }).catch(() => {});
+      return;
+    }
+
+    const payload: DraftData = {
+      annotations,
+      codeAnnotations,
+      globalAttachments,
+      ...(editedMarkdown !== null ? { editedMarkdown } : {}),
+      ...(editedDocuments.length > 0 ? { editedDocuments } : {}),
+      ts: Date.now(),
+    };
+
+    const body = JSON.stringify(payload);
+    const headers = { 'Content-Type': 'application/json' };
+    fetch('/api/draft', { method: 'POST', headers, body, keepalive }).catch(() => {
+      // Chromium caps keepalive bodies (~64KB); retry without it. Completes
+      // fine when the page was only backgrounded, best-effort on close.
+      if (keepalive && canPersistRef.current) fetch('/api/draft', { method: 'POST', headers, body }).catch(() => {});
+      // Otherwise silent failure — draft is best-effort.
+    });
+  }, []);
+
+  const scheduleDraftSave = useCallback(() => {
+    if (!canPersistRef.current || !hasMountedRef.current) return;
+    if (timerRef.current) clearTimeout(timerRef.current);
+
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      persistNow(false);
+    }, DEBOUNCE_MS);
+  }, [persistNow]);
+
+  // Flush a pending save when the page is backgrounded or closed — otherwise
+  // the last debounce window of typing is lost on tab close, and reopening
+  // the (still-running) session would restore a draft missing those
+  // keystrokes. Only fires when a save is actually pending.
+  useEffect(() => {
+    const flush = () => {
+      if (timerRef.current === null) return;
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+      persistNow(true);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flush);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flush);
+    };
+  }, [persistNow]);
+
   // Debounced auto-save on annotation changes
   useEffect(() => {
     if (!isApiMode || isSharedSession || submitted) return;
     if (!hasMountedRef.current) return;
-    if (annotations.length === 0 && codeAnnotations.length === 0 && globalAttachments.length === 0) return;
+    scheduleDraftSave();
+  }, [annotations, codeAnnotations, globalAttachments, isApiMode, isSharedSession, submitted, scheduleDraftSave]);
 
-    if (timerRef.current) clearTimeout(timerRef.current);
-
-    timerRef.current = setTimeout(() => {
-      const payload: DraftData = {
-        annotations,
-        codeAnnotations,
-        globalAttachments,
-        ts: Date.now(),
-      };
-
-      fetch('/api/draft', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch(() => {
-        // Silent failure — draft is best-effort
-      });
-    }, DEBOUNCE_MS);
-
+  // Clear any pending save on unmount.
+  useEffect(() => {
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [annotations, codeAnnotations, globalAttachments, isApiMode, isSharedSession, submitted]);
+  }, []);
 
-  const restoreDraft = useCallback(() => {
+  const restoreDraft = useCallback((): RestoredDraft => {
     const data = draftDataRef.current;
     setDraftBanner(null);
     draftDataRef.current = null;
 
-    if (!data) return { annotations: [], codeAnnotations: [], globalAttachments: [] };
+    if (!data) return { annotations: [], codeAnnotations: [], globalAttachments: [], editedMarkdown: null, editedDocuments: [] };
 
     return data;
   }, []);
@@ -175,5 +311,5 @@ export function useAnnotationDraft({
     });
   }, []);
 
-  return { draftBanner, restoreDraft, dismissDraft };
+  return { draftBanner, restoreDraft, scheduleDraftSave, dismissDraft };
 }

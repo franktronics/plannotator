@@ -14,7 +14,7 @@
 import { isRemoteSession, getServerHostname, getServerPort } from "./remote";
 import { getRepoInfo } from "./repo";
 import type { Origin } from "@plannotator/shared/agents";
-import { handleImage, handleUpload, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon } from "./shared-handlers";
+import { handleImage, handleUpload, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon, handleSaveNotes } from "./shared-handlers";
 import { handleDoc, handleDocExists, handleFileBrowserFiles, handleObsidianVaults, handleObsidianFiles, handleObsidianDoc } from "./reference-handlers";
 import { warmFileListCache } from "@plannotator/shared/resolve-file";
 import { contentHash, deleteDraft } from "./draft";
@@ -495,6 +495,11 @@ export async function startAnnotateServer(
                   : "Failed to process feedback";
               return Response.json({ error: message }, { status: 500 });
             }
+          }
+
+          // API: Save notes to external integrations (Obsidian, Bear, Octarine)
+          if (url.pathname === "/api/save-notes" && req.method === "POST") {
+            return handleSaveNotes(req);
           }
 
           // Favicon

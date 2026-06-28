@@ -357,12 +357,21 @@ class CodexAppServerProcess {
     });
 
     // JSON-RPC handshake: initialize (request) then initialized (notification).
-    await this.sendAndWait({
-      method: "initialize",
-      params: {
-        clientInfo: { name: CLIENT_NAME, title: "Plannotator", version: "1.0.0" },
-      },
-    }, initTimeoutMs);
+    // If initialize times out or rejects, the OS process is still alive but
+    // never usable. Kill it here so `_alive` flips back to false — otherwise
+    // ensureThread() sees a live process, skips re-spawn, and every subsequent
+    // query hangs on the uninitialized handshake until the idle timer fires.
+    try {
+      await this.sendAndWait({
+        method: "initialize",
+        params: {
+          clientInfo: { name: CLIENT_NAME, title: "Plannotator", version: "1.0.0" },
+        },
+      }, initTimeoutMs);
+    } catch (err) {
+      this.kill();
+      throw err;
+    }
     this.send({ method: "initialized", params: {} });
   }
 

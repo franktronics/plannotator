@@ -45,6 +45,7 @@ export interface Annotation {
     tex: string;
     displayMode: boolean;
   }>; // math elements covered by a mixed text+formula selection
+  prUrl?: string; // code-review PR mode: the PR this note belongs to, so it isn't shown/exported against another PR after an in-place switch
   // web-highlighter metadata for cross-element selections
   startMeta?: {
     parentTagName: string;
@@ -120,6 +121,7 @@ export interface CommentAnnotation {
   commentBody: string;
   text: string;           // the reviewer's note
   createdAt: number;
+  prUrl?: string;         // the PR this note belongs to (see Annotation.prUrl)
 }
 
 export interface CodeAnnotation {

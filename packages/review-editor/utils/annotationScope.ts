@@ -13,9 +13,24 @@ export function annotationMatchesPrScope(
   prDiffScope: string | undefined,
 ): boolean {
   return (
-    (!a.prUrl || !prUrl || a.prUrl === prUrl) &&
+    proseAnnotationMatchesPr(a, prUrl) &&
     (!a.diffScope || !prDiffScope || a.diffScope === prDiffScope)
   );
+}
+
+/**
+ * True when a prose annotation (PR description / PR comment note) belongs to the
+ * active PR, or carries no PR scope. Mirrors the prUrl half of
+ * {@link annotationMatchesPrScope} for the two prose stores, which have no diff
+ * scope of their own. Keeps notes made on one PR from rendering/exporting against
+ * another after an in-place switch — without discarding them (a switch back
+ * re-reveals them).
+ */
+export function proseAnnotationMatchesPr(
+  a: { prUrl?: string },
+  prUrl: string | undefined,
+): boolean {
+  return !a.prUrl || !prUrl || a.prUrl === prUrl;
 }
 
 /** True when an annotation is file-scoped (whole-file comment, not a line/general one). */

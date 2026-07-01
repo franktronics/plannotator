@@ -81,7 +81,7 @@ import {
   REVIEW_CODE_NAV_PANEL_ID,
 } from './dock/reviewPanelTypes';
 import type { DiffFile, AnnotationScrollTarget } from './types';
-import { annotationMatchesPrScope } from './utils/annotationScope';
+import { annotationMatchesPrScope, proseAnnotationMatchesPr } from './utils/annotationScope';
 import type { DiffOption, WorktreeInfo, GitContext } from '@plannotator/shared/types';
 import type { PRMetadata } from '@plannotator/shared/pr-types';
 import type { PRDiffScope, PRDiffScopeOption, PRStackInfo, PRStackTree } from '@plannotator/shared/pr-stack';
@@ -1515,9 +1515,10 @@ const ReviewApp: React.FC = () => {
   // The web-highlighter marks live in AnnotatableDescription; App owns only the
   // data. The wrapper reconciles marks (apply new / remove deleted) off this store.
   const handleAddDescriptionAnnotation = useCallback((ann: Annotation) => {
-    setDescriptionAnnotations(prev => [...prev, ann]);
+    // Stamp the active PR so the note stays bound to it across an in-place switch.
+    setDescriptionAnnotations(prev => [...prev, { ...ann, prUrl: prMetadata?.url }]);
     setSelectedDescriptionAnnotationId(ann.id);
-  }, []);
+  }, [prMetadata?.url]);
 
   const handleSelectDescriptionAnnotation = useCallback((id: string | null) => {
     setSelectedDescriptionAnnotationId(prev => (!id || prev === id ? null : id));
@@ -1546,10 +1547,11 @@ const ReviewApp: React.FC = () => {
       commentBody,
       text,
       createdAt: Date.now(),
+      prUrl: prMetadata?.url, // bind to the active PR (survives an in-place switch)
     };
     setCommentAnnotations(prev => [...prev, ann]);
     setSelectedCommentAnnotationId(ann.id);
-  }, []);
+  }, [prMetadata?.url]);
 
   const handleSelectCommentAnnotation = useCallback((id: string | null) => {
     setSelectedCommentAnnotationId(prev => (!id || prev === id ? null : id));
@@ -1574,6 +1576,19 @@ const ReviewApp: React.FC = () => {
       scope: { kind: 'selection', label: context.label ?? 'PR comment', text: context.text },
     });
   }, [askAI]);
+
+  // Prose notes for the ACTIVE PR only. The full arrays keep every PR's notes
+  // (and persist them to the draft) so an in-place switch loses nothing; these
+  // filtered views drive display/export/count so notes never render or ship
+  // against the wrong PR. A switch back re-reveals the originals.
+  const visibleDescriptionAnnotations = useMemo(
+    () => descriptionAnnotations.filter(a => proseAnnotationMatchesPr(a, prMetadata?.url)),
+    [descriptionAnnotations, prMetadata?.url],
+  );
+  const visibleCommentAnnotations = useMemo(
+    () => commentAnnotations.filter(a => proseAnnotationMatchesPr(a, prMetadata?.url)),
+    [commentAnnotations, prMetadata?.url],
+  );
 
   // Sidebar navigation: select AND scroll-to the comment (DiffsHub "set +
   // scroll"). The token bump re-fires the panels' scroll effect even when the
@@ -1674,13 +1689,13 @@ const ReviewApp: React.FC = () => {
     onSelectAnnotation: handleSelectAnnotation,
     onNavigateToAnnotation: handleNavigateToAnnotation,
     onDeleteAnnotation: handleDeleteAnnotation,
-    descriptionAnnotations,
+    descriptionAnnotations: visibleDescriptionAnnotations,
     selectedDescriptionAnnotationId,
     onAddDescriptionAnnotation: handleAddDescriptionAnnotation,
     onSelectDescriptionAnnotation: handleSelectDescriptionAnnotation,
     onDeleteDescriptionAnnotation: handleDeleteDescriptionAnnotation,
     onAskAIForDescription: handleAskAIForDescription,
-    commentAnnotations,
+    commentAnnotations: visibleCommentAnnotations,
     selectedCommentAnnotationId,
     onAddCommentAnnotation: handleAddCommentAnnotation,
     onSelectCommentAnnotation: handleSelectCommentAnnotation,
@@ -1736,9 +1751,9 @@ const ReviewApp: React.FC = () => {
     diffLineDiffType, diffShowLineNumbers, diffShowBackground,
     diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd,
     allAnnotations, externalAnnotations,
-    descriptionAnnotations, selectedDescriptionAnnotationId, handleAddDescriptionAnnotation,
+    visibleDescriptionAnnotations, selectedDescriptionAnnotationId, handleAddDescriptionAnnotation,
     handleSelectDescriptionAnnotation, handleDeleteDescriptionAnnotation, handleAskAIForDescription,
-    commentAnnotations, selectedCommentAnnotationId, handleAddCommentAnnotation,
+    visibleCommentAnnotations, selectedCommentAnnotationId, handleAddCommentAnnotation,
     handleSelectCommentAnnotation, handleDeleteCommentAnnotation, handleAskAIForComment, commentScrollTarget,
     selectedAnnotationId, scrollTargetAnnotation, pendingSelection, handleLineSelection,
     handleAddAnnotation, handleAddFileComment, handleAddFileCommentForFile, handleEditAnnotation,
@@ -1783,15 +1798,15 @@ const ReviewApp: React.FC = () => {
     if (editorAnnotations.length > 0) {
       parts.push(exportEditorAnnotations(editorAnnotations).trim());
     }
-    const prose = buildProseFeedback(descriptionAnnotations, commentAnnotations, prContext?.body);
+    const prose = buildProseFeedback(visibleDescriptionAnnotations, visibleCommentAnnotations, prContext?.body);
     if (prose) parts.push(prose);
     // Fall back to the standard "no feedback" message only when there's nothing.
     return parts.length > 0
       ? parts.join('\n\n')
       : exportReviewFeedback([], prMetadata, feedbackDiffContext, prReviewScopeLabel);
-  }, [allAnnotations, prMetadata, feedbackDiffContext, prReviewScopeLabel, editorAnnotations, descriptionAnnotations, prContext?.body, commentAnnotations]);
+  }, [allAnnotations, prMetadata, feedbackDiffContext, prReviewScopeLabel, editorAnnotations, visibleDescriptionAnnotations, prContext?.body, visibleCommentAnnotations]);
 
-  const totalAnnotationCount = allAnnotations.length + editorAnnotations.length + descriptionAnnotations.length + commentAnnotations.length;
+  const totalAnnotationCount = allAnnotations.length + editorAnnotations.length + visibleDescriptionAnnotations.length + visibleCommentAnnotations.length;
 
   // Copy the same full feedback the agent gets (code + editor + PR description +
   // PR comment notes), not just code annotations. Defined after feedbackMarkdown
@@ -1999,9 +2014,9 @@ const ReviewApp: React.FC = () => {
     // inline review comments — seed them into the review body instead (quoted),
     // where the user can edit before submitting. Also means a review with only
     // prose notes still has something to post.
-    setPlatformGeneralComment(buildProseFeedback(descriptionAnnotations, commentAnnotations, prContext?.body));
+    setPlatformGeneralComment(buildProseFeedback(visibleDescriptionAnnotations, visibleCommentAnnotations, prContext?.body));
     setPlatformCommentDialog({ action, plan });
-  }, [allAnnotations, editorAnnotations, files, prMetadata, descriptionAnnotations, commentAnnotations, prContext?.body]);
+  }, [allAnnotations, editorAnnotations, files, prMetadata, visibleDescriptionAnnotations, visibleCommentAnnotations, prContext?.body]);
 
   // Double-tap Option/Alt to toggle review destination (PR mode only)
   useEffect(() => {
@@ -2659,11 +2674,11 @@ const ReviewApp: React.FC = () => {
                 width={panelResize.width}
                 editorAnnotations={editorAnnotations}
                 onDeleteEditorAnnotation={deleteEditorAnnotation}
-                descriptionAnnotations={descriptionAnnotations}
+                descriptionAnnotations={visibleDescriptionAnnotations}
                 selectedDescriptionAnnotationId={selectedDescriptionAnnotationId}
                 onSelectDescriptionAnnotation={handleSelectDescriptionAnnotation}
                 onDeleteDescriptionAnnotation={handleDeleteDescriptionAnnotation}
-                commentAnnotations={commentAnnotations}
+                commentAnnotations={visibleCommentAnnotations}
                 selectedCommentAnnotationId={selectedCommentAnnotationId}
                 onSelectCommentAnnotation={handleSelectCommentAnnotation}
                 onDeleteCommentAnnotation={handleDeleteCommentAnnotation}

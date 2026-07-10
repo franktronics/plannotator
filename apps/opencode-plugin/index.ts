@@ -44,6 +44,7 @@ import {
   shouldModifyPrompts,
   shouldRegisterSubmitPlan,
   shouldRejectSubmitPlanForAgent,
+  shouldStartImplementationForAgent,
   type RuntimeMode,
   type PlannotatorOpenCodeOptions,
 } from "./workflow";
@@ -659,6 +660,8 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
 
             const shouldSwitchAgent = result.agentSwitch && result.agentSwitch !== 'disabled';
             const targetAgent = result.agentSwitch || 'build';
+            const shouldStartImplementation = shouldSwitchAgent
+              && shouldStartImplementationForAgent(targetAgent, workflowOptions);
 
             if (shouldSwitchAgent) {
               try {
@@ -667,7 +670,12 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
                   body: {
                     agent: targetAgent,
                     noReply: true,
-                    parts: [{ type: "text", text: "Proceed with implementation" }],
+                    parts: [{
+                      type: "text",
+                      text: shouldStartImplementation
+                        ? "Proceed with implementation"
+                        : "Plan approved. Plan mode remains active; no implementation has been requested.",
+                    }],
                   },
                 });
               } catch {
@@ -680,7 +688,7 @@ Use /plannotator-last or /plannotator-annotate for manual review, or set workflo
                 planFilePath: backingPath,
                 doneMsg: result.savedPath ? `Saved to: ${result.savedPath}` : "",
                 feedback: result.feedback,
-                proceedSuffix: shouldSwitchAgent
+                proceedSuffix: shouldStartImplementation
                   ? "\n\nProceed with implementation, incorporating these notes where applicable."
                   : "",
               });
